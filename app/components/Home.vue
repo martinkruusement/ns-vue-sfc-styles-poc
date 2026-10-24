@@ -6,7 +6,7 @@
             </ActionBar>
 
             <GridLayout>
-                <Label class="text-xl align-middle text-center text-gray-500" :text="message" />
+                <StyleProbe/>
             </GridLayout>
         </Page>
     </Frame>
@@ -14,6 +14,7 @@
 
 <script setup lang="ts">
   import { computed } from 'nativescript-vue'
+  import StyleProbe from '@/components/sfc-style-tests/StyleProbe.vue'
 
   const message = computed(() => "Blank {N}-Vue app");
 </script>
