@@ -5,10 +5,12 @@
   "license": "MIT-0",
   "private": true,
   "scripts": {
-    "packages:setup": "node scripts/setup-packages.mjs",
-    "local:build": "cd ../ns-css-improvements/integration/NativeScript && npx nx run-many -t build -p core,vite,webpack5 && cd ../nativescript-vue && npm run build",
-    "local:install": "node scripts/install-local-packages.mjs",
-    "local:update": "npm run local:build && npm run local:install",
+    "postinstall": "node scripts/packages.mjs postinstall",
+    "packages": "node scripts/packages.mjs status",
+    "packages:patched": "node scripts/packages.mjs patched",
+    "packages:published": "node scripts/packages.mjs published",
+    "packages:local": "node scripts/packages.mjs local",
+    "patches:generate": "node scripts/generate-patches.mjs",
     "android:vite": "ns run android",
     "android:vite:bundle": "ns run android --no-hmr",
     "android:webpack": "ns run android --config nativescript.webpack.config",
@@ -20,19 +22,20 @@
     "test": "node --test 'app/components/sfc-style-tests/*.test.mjs'"
   },
   "dependencies": {
-    "@nativescript/core": "file:../ns-css-improvements/integration/NativeScript/dist/packages/core",
+    "@nativescript/core": "9.1.3",
     "@valor/nativescript-websockets": "^2.0.3",
-    "nativescript-vue": "file:../ns-css-improvements/integration/nativescript-vue"
+    "nativescript-vue": "3.1.2"
   },
   "devDependencies": {
     "@nativescript/android": "9.1.1",
-    "@nativescript/tailwind": "file:../ns-css-improvements/integration/tailwind",
+    "@nativescript/tailwind": "4.1.0",
     "@nativescript/types": "~9.0.0",
-    "@nativescript/vite": "file:../ns-css-improvements/integration/NativeScript/dist/packages/vite",
-    "@nativescript/webpack": "file:../ns-css-improvements/integration/NativeScript/dist/packages/webpack5",
+    "@nativescript/vite": "8.0.21",
+    "@nativescript/webpack": "5.0.39",
     "@types/node": "^20.0.0",
     "@vitejs/plugin-vue": "^6.0.10",
     "@vitejs/plugin-vue-jsx": "^5.1.6",
+    "patch-package": "^8.0.1",
     "tailwindcss": "^4.0.0",
     "typescript": "~6.0.0",
     "vue-tsc": "^3.3.13"

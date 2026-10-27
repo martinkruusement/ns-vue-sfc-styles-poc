@@ -1,0 +1,24 @@
+diff --git a/node_modules/@nativescript/core/ui/styling/css-animation-parser.js b/node_modules/@nativescript/core/ui/styling/css-animation-parser.js
+index 45e427d..94d0590 100644
+--- a/node_modules/@nativescript/core/ui/styling/css-animation-parser.js
++++ b/node_modules/@nativescript/core/ui/styling/css-animation-parser.js
+@@ -103,12 +103,13 @@ export function keyframeAnimationsFromCSSProperty(value, animations) {
+      * Matches commas except if the comma is contained in parenthesis - ex. cubic-bezier(1, 1, 1, 1).
+      */
+     const MULTIPLE_SPLIT_RE = /,(?![^(]*\))/;
+-    const isTime = (v) => !!v.match(/\dm?s$/g);
+-    const isTimingFunction = (v) => !!v.match(/ease|linear|ease-in|ease-out|ease-in-out|spring|cubic-bezier/g);
+-    const isIterationCount = (v) => !!v.match(/infinite|[\d.]+$/g);
+-    const isDirection = (v) => !!v.match(/normal|reverse|alternate|alternate-reverse/g);
+-    const isFillMode = (v) => !!v.match(/none|forwards|backwards|both/g);
+-    const isPlayState = (v) => !!v.match(/running|paused/g);
++    // anchored to whole tokens; cubic-bezier() is validated by the converter
++    const isTime = (v) => /^[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?m?s$/.test(v);
++    const isTimingFunction = (v) => /^(?:ease|linear|ease-in|ease-out|ease-in-out|spring)$|^cubic-bezier\(/.test(v);
++    const isIterationCount = (v) => /^(?:infinite|[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)$/.test(v);
++    const isDirection = (v) => /^(?:normal|reverse|alternate|alternate-reverse)$/.test(v);
++    const isFillMode = (v) => /^(?:none|forwards|backwards|both)$/.test(v);
++    const isPlayState = (v) => /^(?:running|paused)$/.test(v);
+     const values = value.split(MULTIPLE_SPLIT_RE);
+     for (const parsedValue of values) {
+         const animationInfo = new KeyframeAnimationInfo();

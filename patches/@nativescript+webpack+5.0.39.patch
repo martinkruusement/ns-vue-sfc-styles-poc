@@ -1,0 +1,390 @@
+diff --git a/node_modules/@nativescript/webpack/dist/configuration/vue.js b/node_modules/@nativescript/webpack/dist/configuration/vue.js
+index 46441a1..0b32d8b 100644
+--- a/node_modules/@nativescript/webpack/dist/configuration/vue.js
++++ b/node_modules/@nativescript/webpack/dist/configuration/vue.js
+@@ -15,8 +15,12 @@ const base_1 = __importDefault(require("./base"));
+ function default_1(config, env = index_1.env) {
+     (0, base_1.default)(config, env);
+     const platform = (0, platform_1.getPlatformName)();
+-    // we need to patch VueLoader if we want to enable hmr
+-    if (env.hmr) {
++    const useVueLoader16Config = shouldUseVueLoader16Config();
++    const stylePostLoaderPath = useVueLoader16Config
++        ? 'vue-loader/dist/stylePostLoader.js'
++        : 'vue-loader/lib/loaders/stylePostLoader.js';
++    // vue-loader 15 needs a source patch to enable hmr
++    if (env.hmr && !useVueLoader16Config) {
+         patchVueLoaderForHMR();
+     }
+     // resolve .vue files
+@@ -29,6 +33,13 @@ function default_1(config, env = index_1.env) {
+         .use('vue-loader')
+         .loader('vue-loader')
+         .tap((options) => {
++        // target node makes vue-loader 16+ emit SSR code without HMR
++        if (useVueLoader16Config) {
++            return {
++                ...options,
++                isServerBuild: false,
++            };
++        }
+         return {
+             ...options,
+             compiler: getTemplateCompiler(),
+@@ -41,12 +52,12 @@ function default_1(config, env = index_1.env) {
+         .rule('css')
+         .use('vue-css-loader')
+         .after('css2json-loader')
+-        .loader('vue-loader/lib/loaders/stylePostLoader.js');
++        .loader(stylePostLoaderPath);
+     config.module
+         .rule('scss')
+         .use('vue-css-loader')
+         .after('css2json-loader')
+-        .loader('vue-loader/lib/loaders/stylePostLoader.js');
++        .loader(stylePostLoaderPath);
+     // set up ts support in vue files
+     config.module
+         .rule('ts')
+@@ -113,4 +124,23 @@ function getTemplateCompiler() {
+         // ignore
+     }
+ }
++function shouldUseVueLoader16Config() {
++    var _a;
++    // the project's copy first, since Vue 2 apps install vue-loader 15 there
++    const vueLoaderVersion = (_a = (0, dependencies_1.getDependencyVersion)('vue-loader')) !== null && _a !== void 0 ? _a : require('vue-loader/package.json').version;
++    if (parseInt(vueLoaderVersion, 10) < 16) {
++        return false;
++    }
++    // vue-loader 16+ cannot compile Vue 2, keep the vue-loader 15 config
++    const nativescriptVueVersion = (0, dependencies_1.getDependencyVersion)('nativescript-vue');
++    if (nativescriptVueVersion && parseInt(nativescriptVueVersion, 10) < 3) {
++        (0, log_1.error)(`
++			nativescript-vue ${nativescriptVueVersion} needs vue-loader 15, but vue-loader ${vueLoaderVersion} was found.
++			Install vue-loader 15 and configure it in webpack.config.js as described in
++			https://github.com/NativeScript/NativeScript/issues/11009
++		`);
++        return false;
++    }
++    return true;
++}
+ //# sourceMappingURL=vue.js.map
+\ No newline at end of file
+diff --git a/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/hmr.runtime.d.ts b/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/hmr.runtime.d.ts
+new file mode 100644
+index 0000000..07e3a23
+--- /dev/null
++++ b/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/hmr.runtime.d.ts
+@@ -0,0 +1,14 @@
++interface StyleScope {
++    addTaggedAdditionalCSS(cssText: unknown, tag: string): boolean;
++    removeTaggedAdditionalCSS(tag: string): boolean;
++}
++/**
++ * Applies the css of a stylesheet module in an HMR build, keeping its place in the
++ * cascade when the module is hot-replaced.
++ * @param module The webpack module of the stylesheet.
++ * @param tag The tag the css is registered under.
++ * @param css The css values of the module, as passed to addTaggedAdditionalCSS.
++ * @param styleScope The `@nativescript/core/ui/styling/style-scope` module.
++ */
++export declare function applyHotCss(module: any, tag: string, css: unknown[], styleScope: StyleScope): void;
++export {};
+diff --git a/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/hmr.runtime.js b/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/hmr.runtime.js
+new file mode 100644
+index 0000000..6131c69
+--- /dev/null
++++ b/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/hmr.runtime.js
+@@ -0,0 +1,77 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.applyHotCss = applyHotCss;
++const TAG_ORDER_KEY = '__NS_WEBPACK_CSS_TAG_ORDER__';
++function getTagOrder() {
++    const scope = globalThis;
++    if (!scope[TAG_ORDER_KEY]) {
++        scope[TAG_ORDER_KEY] = new Map();
++    }
++    return scope[TAG_ORDER_KEY];
++}
++function sameCss(previous, css) {
++    return (previous.length === css.length &&
++        previous.every((cssText, index) => cssText === css[index] ||
++            JSON.stringify(cssText) === JSON.stringify(css[index])));
++}
++// Core appends a re-added tag last, so re-add every tag after it.
++function reapplyFrom(order, tag, styleScope) {
++    let reached = false;
++    for (const [otherTag, sheets] of order) {
++        reached = reached || otherTag === tag;
++        if (!reached) {
++            continue;
++        }
++        try {
++            styleScope.removeTaggedAdditionalCSS(otherTag);
++            for (const css of sheets.values()) {
++                for (const cssText of css || []) {
++                    styleScope.addTaggedAdditionalCSS(cssText, otherTag);
++                }
++            }
++        }
++        catch (e) { }
++    }
++}
++/**
++ * Applies the css of a stylesheet module in an HMR build, keeping its place in the
++ * cascade when the module is hot-replaced.
++ * @param module The webpack module of the stylesheet.
++ * @param tag The tag the css is registered under.
++ * @param css The css values of the module, as passed to addTaggedAdditionalCSS.
++ * @param styleScope The `@nativescript/core/ui/styling/style-scope` module.
++ */
++function applyHotCss(module, tag, css, styleScope) {
++    var _a;
++    const order = getTagOrder();
++    const known = order.has(tag);
++    if (!known) {
++        order.set(tag, new Map());
++    }
++    const sheets = order.get(tag);
++    const previous = sheets.get(module.id);
++    const hot = module.hot;
++    // Guards a module executed twice without a dispose in between.
++    if (!previous || !sameCss(previous, css)) {
++        // Outside hot updates, core could scope re-added tags to a loading page.
++        if (known && ((_a = hot === null || hot === void 0 ? void 0 : hot.status) === null || _a === void 0 ? void 0 : _a.call(hot)) === 'apply') {
++            sheets.set(module.id, css);
++            reapplyFrom(order, tag, styleScope);
++        }
++        else {
++            css.forEach((cssText) => styleScope.addTaggedAdditionalCSS(cssText, tag));
++            sheets.set(module.id, css);
++        }
++    }
++    if (hot) {
++        hot.accept();
++        hot.dispose(() => {
++            sheets.set(module.id, null);
++            try {
++                styleScope.removeTaggedAdditionalCSS(tag);
++            }
++            catch (e) { }
++        });
++    }
++}
++//# sourceMappingURL=hmr.runtime.js.map
+\ No newline at end of file
+diff --git a/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/index.js b/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/index.js
+index 434c06f..f81712e 100644
+--- a/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/index.js
++++ b/node_modules/@nativescript/webpack/dist/loaders/apply-css-loader/index.js
+@@ -6,6 +6,8 @@ const cssLoaderWarning = (0, ts_dedent_1.dedent) `
+ 	The apply-css-loader requires the file to be pre-processed by either css-loader or css2json-loader.
+ 	Make sure the appropriate loader is applied before apply-css-loader.
+ `;
++// Absolute, so every stylesheet resolves the same runtime module.
++const hmrRuntimePath = JSON.stringify(require.resolve('./hmr.runtime'));
+ function loader(content, map) {
+     const hasLoader = (loader) => {
+         var _a;
+@@ -14,21 +16,22 @@ function loader(content, map) {
+     // add a tag to the applied css
+     const tag = JSON.stringify(this.resourcePath);
+     const tagCode = this.mode === 'development' ? `, ${JSON.stringify(this.resourcePath)}` : '';
++    // In HMR builds the runtime applies the css, keeping the cascade order.
++    const addCode = this.hot
++        ? (0, ts_dedent_1.dedent) `
++			const ___APPLY_CSS_LOADER_CSS___ = [];
++			const addTaggedAdditionalCSS = (css) => ___APPLY_CSS_LOADER_CSS___.push(css);
++		`
++        : `const { addTaggedAdditionalCSS } = require("@nativescript/core/ui/styling/style-scope");`;
+     const hmrCode = this.hot
+         ? (0, ts_dedent_1.dedent) `
+-			if(module.hot) {
+-				module.hot.accept()
+-				module.hot.dispose(() => {
+-					const { removeTaggedAdditionalCSS } = require("@nativescript/core/ui/styling/style-scope");
+-					removeTaggedAdditionalCSS(${tag})
+-				})
+-			}
++			require(${hmrRuntimePath}).applyHotCss(module, ${tag}, ___APPLY_CSS_LOADER_CSS___, require("@nativescript/core/ui/styling/style-scope"))
+ 		`
+         : ``;
+     if (hasLoader('css2json-loader')) {
+         content = (0, ts_dedent_1.dedent) `
+ 			${content}
+-			const { addTaggedAdditionalCSS } = require("@nativescript/core/ui/styling/style-scope");
++			${addCode}
+ 			addTaggedAdditionalCSS(___CSS2JSON_LOADER_EXPORT___${tagCode})
+ 			${hmrCode}
+ 		`;
+@@ -36,7 +39,7 @@ function loader(content, map) {
+     else if (hasLoader('css-loader')) {
+         content = (0, ts_dedent_1.dedent) `
+ 			${content}
+-			const { addTaggedAdditionalCSS } = require("@nativescript/core/ui/styling/style-scope");
++			${addCode}
+ 			if (___CSS_LOADER_EXPORT___ && typeof ___CSS_LOADER_EXPORT___.forEach === "function") {
+ 				___CSS_LOADER_EXPORT___.forEach(cssExport => {
+ 					if (cssExport.length > 1 && cssExport[1]) {
+diff --git a/node_modules/@nativescript/webpack/dist/loaders/css2json-loader/index.js b/node_modules/@nativescript/webpack/dist/loaders/css2json-loader/index.js
+index ee01d6d..dab5eb2 100644
+--- a/node_modules/@nativescript/webpack/dist/loaders/css2json-loader/index.js
++++ b/node_modules/@nativescript/webpack/dist/loaders/css2json-loader/index.js
+@@ -4,15 +4,26 @@ exports.default = loader;
+ exports.joinEscapedSelectorCommas = joinEscapedSelectorCommas;
+ const css_1 = require("css");
+ const loader_utils_1 = require("loader-utils");
++const path_1 = require("path");
+ const ts_dedent_1 = require("ts-dedent");
+ const betweenQuotesPattern = /('|")(.*?)\1/;
+ const unpackUrlPattern = /url\(([^\)]+)\)/;
+ const inlineLoader = '!css2json-loader?useForImports!';
+ function loader(content, map) {
+-    var _a;
+     const options = this.getOptions() || {};
+     const inline = !!options.useForImports;
+     const requirePrefix = inline ? inlineLoader : '';
++    const query = new URLSearchParams(this.resourceQuery || '');
++    // vue-loader requests <style module> as module=true, named ones as module=<name>
++    if (query.has('module') && query.get('module') !== 'false') {
++        const callback = this.async();
++        compileCssModule(this, content, query.get('id') || '', requirePrefix).then((code) => callback(null, code, map), (error) => callback(error));
++        return;
++    }
++    this.callback(null, generateCode(content, requirePrefix, 'export default ___CSS2JSON_LOADER_EXPORT___'), map);
++}
++function generateCode(content, requirePrefix, exportCode) {
++    var _a;
+     const ast = (0, css_1.parse)(content);
+     repairSelectors((_a = ast.stylesheet) === null || _a === void 0 ? void 0 : _a.rules);
+     // todo: revise if this is necessary
+@@ -25,15 +36,122 @@ function loader(content, map) {
+         dependencies.push(`require("${requirePrefix}${requireURI}")`);
+     });
+     const str = JSON.stringify(ast, (k, v) => (k === 'position' ? undefined : v));
+-    // map.mappings = map.mappings.replace(/;{2,}/, '')
+-    const code = (0, ts_dedent_1.dedent) `
++    return (0, ts_dedent_1.dedent) `
+ 	/* CSS2JSON */
+ 	${dependencies.join('\n')}
+ 	const ___CSS2JSON_LOADER_EXPORT___ = ${str}
+-	export default ___CSS2JSON_LOADER_EXPORT___
++	${exportCode}
+ 	`;
+-    this.callback(null, code, //`${dependencies.join('\n')}module.exports = ${str};`,
+-    map);
++}
++// the options css-loader resolves `composes: x from "file"` with
++const composesResolveOptions = {
++    dependencyType: 'icss',
++    conditionNames: ['style'],
++    extensions: ['...'],
++    mainFields: ['css', 'style', 'main', '...'],
++    mainFiles: ['index', '...'],
++    preferRelative: true,
++};
++async function compileCssModule(loaderContext, content, id, requirePrefix) {
++    const { resourcePath } = loaderContext;
++    const { code, modules } = await compileModule(loaderContext, content, resourcePath, id, [resourcePath]);
++    // CommonJS: vue-loader 15's proxy namespace then carries the class keys
++    const moduleCode = generateCode(code, requirePrefix, (0, ts_dedent_1.dedent) `
++			const ___CSS2JSON_LOADER_LOCALS___ = ${JSON.stringify(modules)}
++			module.exports = ___CSS2JSON_LOADER_LOCALS___
++		`);
++    if (!loaderContext.hot) {
++        return moduleCode;
++    }
++    // apply-css-loader self-accepts: renamed classes must reach the importing component
++    return (0, ts_dedent_1.dedent) `
++		${moduleCode}
++		if (module.hot) {
++			const cssModules = JSON.stringify(___CSS2JSON_LOADER_LOCALS___);
++			if (module.hot.data && module.hot.data.cssModules !== cssModules) {
++				module.hot.invalidate();
++			}
++			module.hot.dispose((data) => {
++				data.cssModules = cssModules;
++			});
++		}
++	`;
++}
++// chain: the files whose composes led here, to report circular composes
++async function compileModule(loaderContext, source, filename, id, chain) {
++    // required lazily: only CSS modules requests need the SFC compiler
++    const { compileStyleAsync } = require('@vue/compiler-sfc');
++    const { code, modules, errors, rawResult } = await compileStyleAsync({
++        source,
++        filename,
++        id,
++        modules: true,
++        modulesOptions: {
++            Loader: createComposesLoader(loaderContext, id, chain),
++        },
++    });
++    if (errors.length) {
++        throw errors[0];
++    }
++    return { code, modules, root: rawResult.root };
++}
++// postcss-modules' FileSystemLoader crashes the process on a missing composed file
++function createComposesLoader(loaderContext, id, chain) {
++    return class ComposesLoader {
++        constructor() {
++            this.files = [];
++            this.loaded = new Map();
++            this.sources = new Map();
++        }
++        async fetch(request, importer) {
++            // taken before any await: the composed CSS keeps the import order
++            const index = this.files.push('') - 1;
++            const resolve = loaderContext.getResolve(composesResolveOptions);
++            const file = await resolve((0, path_1.dirname)(importer), request);
++            this.files[index] = file;
++            if (!this.loaded.has(file)) {
++                this.loaded.set(file, loadComposedFile(loaderContext, file, id, chain));
++            }
++            const { code, modules } = await this.loaded.get(file);
++            this.sources.set(file, code);
++            return modules;
++        }
++        // read by postcss-modules once every fetch has resolved
++        get finalSource() {
++            return [...new Set(this.files)]
++                .map((file) => this.sources.get(file))
++                .join('');
++        }
++    };
++}
++async function loadComposedFile(loaderContext, file, id, chain) {
++    if (chain.includes(file)) {
++        throw new Error(`Circular composes: ${[...chain, file].join(' -> ')}`);
++    }
++    // the file is read as is, without the loaders of its rule
++    if (!/\.css$/i.test(file)) {
++        throw new Error(`composes can only load .css files, not ${file}`);
++    }
++    loaderContext.addDependency(file);
++    const source = await new Promise((resolve, reject) => {
++        loaderContext.fs.readFile(file, (error, data) => {
++            if (error) {
++                reject(error);
++            }
++            else {
++                resolve(data.toString('utf-8'));
++            }
++        });
++    });
++    const result = await compileModule(loaderContext, source, file, id, [
++        ...chain,
++        file,
++    ]);
++    result.root.walkAtRules('import', (rule) => {
++        // its url would be required relative to the wrong file
++        throw rule.error('@import is not supported in a file loaded by composes');
++    });
++    return result;
+ }
+ function getImportRules(ast) {
+     if (!ast || ast.type !== 'stylesheet' || !ast.stylesheet) {

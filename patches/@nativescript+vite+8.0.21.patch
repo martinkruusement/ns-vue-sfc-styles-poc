@@ -1,0 +1,1957 @@
+diff --git a/node_modules/@nativescript/vite/helpers/main-entry.js b/node_modules/@nativescript/vite/helpers/main-entry.js
+index 05d97b1..69228f7 100644
+--- a/node_modules/@nativescript/vite/helpers/main-entry.js
++++ b/node_modules/@nativescript/vite/helpers/main-entry.js
+@@ -14,6 +14,7 @@ import { createAppCssRefresher } from './app-css-refresh.js';
+ import { rewritePlatformCssImports } from './css-platform-plugin.js';
+ import { buildGlobalSeedStatements, getRuntimeSeedValues } from './global-defines.js';
+ import { BUNDLE_CSS_AST_SENTINEL, inlineBundleCss } from './bundle-css.js';
++import { renameDigitTerminatedScopedKeyframes } from '../hmr/server/css-device-module.js';
+ // Switched to runtime modules to avoid fragile string injection and enable TS checks
+ const projectRoot = getProjectRootPath();
+ const appRootDir = getProjectAppPath();
+@@ -117,7 +118,8 @@ export function mainEntryPlugin(opts) {
+                 return;
+             try {
+                 // Rework AST, position-stripped (the form app.css uses; ~halves size).
+-                const result = inlineBundleCss(bundle, (cssText) => JSON.stringify(parseCssToAst(cssText, { silent: true }), (key, value) => (key === 'position' ? undefined : value)));
++                // Vue scoped keyframes ending in a digit break core's animation shorthand.
++                const result = inlineBundleCss(bundle, (cssText) => JSON.stringify(parseCssToAst(effectiveFlavor === 'vue' ? renameDigitTerminatedScopedKeyframes(cssText) : cssText, { silent: true }), (key, value) => (key === 'position' ? undefined : value)));
+                 if (opts.verbose) {
+                     console.info(`[ns-entry] bundle CSS: ${result.assetCount} asset(s), ${result.bytes} bytes, applied=${result.replaced}`);
+                 }
+@@ -138,7 +140,7 @@ export function mainEntryPlugin(opts) {
+         // We ALSO stash the resolved dep set on the server itself so
+         // the HMR websocket handler can recognize when a non-CSS edit
+         // (e.g. a `.html` template or `.ts` file scanned by Tailwind's
+-        // content config) should trigger a fresh `app.css` fetch. The
++        // content config) should trigger a fresh `app.css` update. The
+         // `preprocessCSS` deps include every file PostCSS reported as
+         // a `dependency` message — for Tailwind 3 with content globs,
+         // Vite's `compileCSS` expands the `dir-dependency` glob into
+diff --git a/node_modules/@nativescript/vite/hmr/client/css-handler.d.ts b/node_modules/@nativescript/vite/hmr/client/css-handler.d.ts
+index 4cc91d6..cfa4115 100644
+--- a/node_modules/@nativescript/vite/hmr/client/css-handler.d.ts
++++ b/node_modules/@nativescript/vite/hmr/client/css-handler.d.ts
+@@ -1,5 +1,12 @@
+ export declare const APP_CSS_TAG = "app.css";
+ export declare function applyCssText(cssText: string, tag?: string): void;
+-export declare function fetchText(url: string): Promise<string>;
++export declare const CSS_FETCH_TIMEOUT_MS = 10000;
++/**
++ * Fetches the stylesheet for an update without `cssText` (older server, or css it could not compile).
++ * @param url Absolute stylesheet URL.
++ * @param timeoutMs Time after which an unsettled request is abandoned.
++ * @returns The response text, or `''` when the request fails or times out.
++ */
++export declare function fetchText(url: string, timeoutMs?: number): Promise<string>;
+ export declare function handleCssUpdates(cssUpdates: any[], httpOrigin: string): Promise<void>;
+ export declare function handleCustomCss(cssText: string): void;
+diff --git a/node_modules/@nativescript/vite/hmr/client/css-handler.js b/node_modules/@nativescript/vite/hmr/client/css-handler.js
+index c42adbc..eca0419 100644
+--- a/node_modules/@nativescript/vite/hmr/client/css-handler.js
++++ b/node_modules/@nativescript/vite/hmr/client/css-handler.js
+@@ -6,6 +6,8 @@ const VERBOSE = !!getGlobalScope().__NS_ENV_VERBOSE__;
+ // `helpers/main-entry.ts` and `entry-runtime.ts::APP_CSS_TAG` so HMR's
+ // remove/add pair replaces the boot-time selectors instead of stacking.
+ export const APP_CSS_TAG = 'app.css';
++// Vue SFC style tags (`/ns/asm`), the only source that unregisters with ''.
++const SFC_CSS_TAG_PREFIX = 'sfc:';
+ function getPreferredCssApplier() {
+     try {
+         const applier = getGlobalScope().__NS_HMR_APPLY_CSS__;
+@@ -24,6 +26,18 @@ function resolveTaggedCssApi() {
+     }
+     return {};
+ }
++function removeTaggedCss(tag) {
++    try {
++        if (!resolveTaggedCssApi().remove?.(tag))
++            return;
++        if (VERBOSE)
++            console.info(`[ns-hmr] CSS removed (tag=${tag})`);
++        restyleRootAndModals(getCore('Application')?.getRootView?.());
++    }
++    catch (e) {
++        console.warn('[ns-hmr] CSS remove failed:', e?.message || String(e));
++    }
++}
+ // CSS helper: apply CSS and refresh the current page so new styles render.
+ //
+ // `tag` scopes the remove+add tagged pair. It defaults to {@link APP_CSS_TAG}
+@@ -32,8 +46,16 @@ function resolveTaggedCssApi() {
+ // component's rules replace independently — applying a component's CSS under
+ // the shared `app.css` tag would otherwise wipe the global stylesheet.
+ export function applyCssText(cssText, tag = APP_CSS_TAG) {
+-    if (typeof cssText !== 'string' || !cssText.length)
++    if (typeof cssText !== 'string')
++        return;
++    if (!cssText.length) {
++        // '' drops an SFC's rules; other tags ignore it.
++        if (String(tag).startsWith(SFC_CSS_TAG_PREFIX)) {
++            removeTaggedCss(tag);
++            getGlobalScope().__NS_CSS_TAG_ORDER__?.delete(tag);
++        }
+         return;
++    }
+     try {
+         // The HTTP-core-realm applier (entry-runtime's `__NS_HMR_APPLY_CSS__`)
+         // always replaces under the global `app.css` tag, so it is only correct
+@@ -57,10 +79,15 @@ export function applyCssText(cssText, tag = APP_CSS_TAG) {
+         const Application = getCore('Application');
+         let appliedTagged = false;
+         if (taggedCss.add && taggedCss.remove) {
++            // Unchanged component css is already in place.
++            if (tag !== APP_CSS_TAG && getGlobalScope().__NS_CSS_TAG_ORDER__?.get(tag) === cssText) {
++                return;
++            }
+             try {
+                 taggedCss.remove(tag);
+                 taggedCss.add(cssText, tag);
+                 appliedTagged = true;
++                keepCascadeOrder(tag, cssText, taggedCss);
+                 if (VERBOSE)
+                     console.info(`[ns-hmr] CSS applied via tagged replace (tag=${tag})`);
+             }
+@@ -85,26 +112,79 @@ export function applyCssText(cssText, tag = APP_CSS_TAG) {
+         console.warn('[ns-hmr] CSS apply failed:', e?.message || String(e));
+     }
+ }
+-// Fetch helper
+-export async function fetchText(url) {
+-    try {
++// Core re-adds a tag last, so re-add the tags registered after it.
++function keepCascadeOrder(tag, cssText, taggedCss) {
++    const g = getGlobalScope();
++    const tagOrder = g.__NS_CSS_TAG_ORDER__ || (g.__NS_CSS_TAG_ORDER__ = new Map());
++    let anchor = null;
++    if (tag !== APP_CSS_TAG) {
++        const known = tagOrder.has(tag);
++        tagOrder.set(tag, cssText);
++        if (!known)
++            return;
++        anchor = tag;
++    }
++    // Prefer the entry runtime's re-add, bound to its core realm.
++    const reapplyShared = g.__NS_CSS_REAPPLY_AFTER__;
++    if (typeof reapplyShared === 'function') {
++        reapplyShared(anchor);
++        return;
++    }
++    let after = anchor === null;
++    for (const [otherTag, otherCss] of tagOrder) {
++        if (after) {
++            try {
++                taggedCss.remove(otherTag);
++                taggedCss.add(otherCss, otherTag);
++            }
++            catch { }
++        }
++        if (otherTag === anchor)
++            after = true;
++    }
++}
++export const CSS_FETCH_TIMEOUT_MS = 10000;
++/**
++ * Fetches the stylesheet for an update without `cssText` (older server, or css it could not compile).
++ * @param url Absolute stylesheet URL.
++ * @param timeoutMs Time after which an unsettled request is abandoned.
++ * @returns The response text, or `''` when the request fails or times out.
++ */
++export async function fetchText(url, timeoutMs = CSS_FETCH_TIMEOUT_MS) {
++    let timer;
++    const timeout = new Promise((resolve) => {
++        timer = setTimeout(() => resolve(undefined), timeoutMs);
++    });
++    const request = (async () => {
++        // Core Http bypasses XMLHttpRequest polyfills that can leave fetch() hanging.
++        const Http = getCore('Http');
++        if (Http && typeof Http.getString === 'function') {
++            return await Http.getString(url);
++        }
+         const g = getGlobalScope();
+         if (typeof g.fetch === 'function') {
+             const res = await g.fetch(url);
+             return await res.text();
+         }
+-        const Http = g.Http;
+-        if (Http && Http.getString) {
+-            return await Http.getString(url);
+-        }
+         if (VERBOSE)
+             console.warn('[ns-hmr] No fetch method available');
+         return '';
++    })();
++    try {
++        const text = await Promise.race([request, timeout]);
++        if (text === undefined) {
++            console.warn(`[ns-hmr] CSS fetch did not complete within ${timeoutMs}ms: ${url}`);
++            return '';
++        }
++        return text;
+     }
+     catch (e) {
+         console.warn('[ns-hmr] Fetch failed:', e?.message || String(e));
+         return '';
+     }
++    finally {
++        clearTimeout(timer);
++    }
+ }
+ // Handle CSS updates from Vite
+ export async function handleCssUpdates(cssUpdates, httpOrigin) {
+@@ -113,21 +193,35 @@ export async function handleCssUpdates(cssUpdates, httpOrigin) {
+     for (const update of cssUpdates) {
+         try {
+             const cssPath = update.path || update.acceptedPath || '';
+-            if (!cssPath || !httpOrigin)
++            if (!cssPath)
+                 continue;
+-            // Build URL: origin + path + ?direct=1&t=<timestamp>
+-            const timestamp = update.timestamp || Date.now();
+-            const sep = cssPath.includes('?') ? '&' : '?';
+-            const url = `${httpOrigin}${cssPath}${sep}direct=1&t=${timestamp}`;
+-            if (VERBOSE)
+-                console.info('[ns-hmr] Fetching CSS:', url);
+-            const cssText = await fetchText(url);
++            let cssText;
++            if (typeof update.cssText === 'string') {
++                cssText = update.cssText;
++                if (VERBOSE)
++                    console.info('[ns-hmr] CSS update carried its text:', cssPath);
++            }
++            else {
++                if (!httpOrigin)
++                    continue;
++                // Build URL: origin + path + ?direct=1&t=<timestamp>
++                const timestamp = update.timestamp || Date.now();
++                const sep = cssPath.includes('?') ? '&' : '?';
++                const url = `${httpOrigin}${cssPath}${sep}direct=1&t=${timestamp}`;
++                if (VERBOSE)
++                    console.info('[ns-hmr] Fetching CSS:', url);
++                cssText = await fetchText(url);
++            }
+             if (cssText) {
+                 // `tag` scopes the replace: app entry CSS (no tag) uses the
+                 // default `app.css` tag; component `styleUrls` edits carry their
+                 // own path so they replace independently of the global stylesheet.
+                 const tag = typeof update.tag === 'string' && update.tag ? update.tag : undefined;
+                 applyCssText(cssText, tag);
++                // App code that imports app.css registered a copy under its path.
++                if (!tag && getGlobalScope().__NS_CSS_TAG_ORDER__?.has(cssPath)) {
++                    applyCssText(cssText, cssPath);
++                }
+             }
+         }
+         catch (e) {
+diff --git a/node_modules/@nativescript/vite/hmr/client/index.js b/node_modules/@nativescript/vite/hmr/client/index.js
+index 7ddf900..3fd8096 100644
+--- a/node_modules/@nativescript/vite/hmr/client/index.js
++++ b/node_modules/@nativescript/vite/hmr/client/index.js
+@@ -70,7 +70,8 @@ function installCssRegister() {
+         return;
+     }
+     const apply = (tag, cssText) => {
+-        if (typeof cssText !== 'string' || !cssText.length) {
++        // '' reaches applyCssText, which drops the tag's rules.
++        if (typeof cssText !== 'string') {
+             return;
+         }
+         try {
+diff --git a/node_modules/@nativescript/vite/hmr/entry-runtime.js b/node_modules/@nativescript/vite/hmr/entry-runtime.js
+index 0d31664..1b9d925 100644
+--- a/node_modules/@nativescript/vite/hmr/entry-runtime.js
++++ b/node_modules/@nativescript/vite/hmr/entry-runtime.js
+@@ -7,6 +7,8 @@ import { installWorkerConstructorTracking } from './shared/runtime/worker-tracki
+ // `helpers/main-entry.ts` so HMR's remove/add pair replaces the
+ // boot-time selectors instead of stacking on top of them.
+ export const APP_CSS_TAG = 'app.css';
++// Vue SFC style tags (`/ns/asm`), the only source that unregisters with ''.
++const SFC_CSS_TAG_PREFIX = 'sfc:';
+ function resolveTaggedCssApi(coreModule) {
+     const candidates = [coreModule, coreModule?.default, globalThis];
+     for (const candidate of candidates) {
+@@ -137,6 +139,32 @@ export function installHttpCoreCssSupport(coreModule, verbose) {
+         // rules disappear (the additive `Application.addCss` cannot
+         // undo previously installed selectors).
+         const taggedCss = resolveTaggedCssApi(coreModule);
++        // Core re-adds a tag last, and later rules win equal-specificity ties.
++        const tagOrder = g.__NS_CSS_TAG_ORDER__ || (g.__NS_CSS_TAG_ORDER__ = new Map());
++        const reapplyTagsAfter = (tag) => {
++            if (!(taggedCss.add && taggedCss.remove)) {
++                return 0;
++            }
++            let after = tag === null;
++            let count = 0;
++            for (const [otherTag, otherCss] of tagOrder) {
++                if (after) {
++                    try {
++                        taggedCss.remove(otherTag);
++                        taggedCss.add(otherCss, otherTag);
++                        count++;
++                    }
++                    catch { }
++                }
++                if (otherTag === tag) {
++                    after = true;
++                }
++            }
++            if (verbose && count)
++                console.info(`[ns-entry] re-registered ${count} stylesheet(s) after ${tag ?? APP_CSS_TAG} to keep cascade order`);
++            return count;
++        };
++        g.__NS_CSS_REAPPLY_AFTER__ = reapplyTagsAfter;
+         const applyCss = (cssText, refreshRoot = true) => {
+             if (typeof cssText !== 'string' || !cssText.length) {
+                 return;
+@@ -153,7 +181,10 @@ export function installHttpCoreCssSupport(coreModule, verbose) {
+                         console.warn('[ns-entry] tagged CSS replace failed, falling back to addCss:', taggedError?.message || taggedError);
+                 }
+             }
+-            if (!appliedTagged) {
++            if (appliedTagged) {
++                reapplyTagsAfter(null);
++            }
++            else {
+                 Application.addCss(cssText);
+             }
+             if (!refreshRoot) {
+@@ -165,13 +196,29 @@ export function installHttpCoreCssSupport(coreModule, verbose) {
+         // Device CSS applier for `.css` modules and component styles. Per-tag
+         // remove+add keeps each source independently replaceable on hot-update.
+         const registerCss = (tag, cssText) => {
+-            if (typeof cssText !== 'string' || !cssText.length) {
++            if (typeof cssText !== 'string') {
+                 return;
+             }
+             try {
+-                if (taggedCss.add && taggedCss.remove) {
++                if (!cssText.length) {
++                    // '' drops an SFC's rules; other tags ignore it.
++                    if (!String(tag).startsWith(SFC_CSS_TAG_PREFIX) || !taggedCss.remove?.(tag)) {
++                        return;
++                    }
++                    tagOrder.delete(tag);
++                }
++                else if (taggedCss.add && taggedCss.remove) {
++                    const known = tagOrder.has(tag);
++                    // Unchanged css, e.g. an SFC re-assembled for a script-only edit.
++                    if (known && tagOrder.get(tag) === cssText) {
++                        return;
++                    }
+                     taggedCss.remove(tag);
+                     taggedCss.add(cssText, tag);
++                    tagOrder.set(tag, cssText);
++                    if (known) {
++                        reapplyTagsAfter(tag);
++                    }
+                 }
+                 else if (Application.addCss) {
+                     Application.addCss(cssText);
+@@ -217,6 +264,8 @@ export function installHttpCoreCssSupport(coreModule, verbose) {
+                     taggedCss.remove(APP_CSS_TAG);
+                     taggedCss.add(appCssAst, APP_CSS_TAG);
+                     cssApplied = true;
++                    // Tags registered before app.css must still follow it.
++                    reapplyTagsAfter(null);
+                     if (verbose)
+                         console.info('[ns-entry] app.css applied in HTTP core realm via AST');
+                 }
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/client/strategy.d.ts b/node_modules/@nativescript/vite/hmr/frameworks/vue/client/strategy.d.ts
+index 606000e..ecf6e9b 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/client/strategy.d.ts
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/client/strategy.d.ts
+@@ -14,7 +14,8 @@ export interface VueDepPropagationDeps {
+  * Non-SFC dependency propagation. When a plain `.ts`/`.js` module changes, the
+  * shared queue evicts + re-imports it, but the live component instances still
+  * hold bindings to the OLD module instance — nothing on the Vue side remounts
+- * (the server only emits `ns:vue-sfc-registry-update` for `.vue` edits). Walk
++ * (the server emits `ns:vue-sfc-registry-update` only for `.vue` edits and for
++ * stylesheets an SFC's `<style>` depends on). Walk
+  * the reverse import graph to every `.vue` boundary, re-assemble each one
+  * (`loadSfcComponent` links the freshly re-imported deps) and reload its
+  * mounted instances in place, as the registry-update path does. Boundaries
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/client/strategy.js b/node_modules/@nativescript/vite/hmr/frameworks/vue/client/strategy.js
+index d860ee6..c5f4df9 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/client/strategy.js
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/client/strategy.js
+@@ -16,7 +16,8 @@ const defaultPropagationDeps = {
+  * Non-SFC dependency propagation. When a plain `.ts`/`.js` module changes, the
+  * shared queue evicts + re-imports it, but the live component instances still
+  * hold bindings to the OLD module instance — nothing on the Vue side remounts
+- * (the server only emits `ns:vue-sfc-registry-update` for `.vue` edits). Walk
++ * (the server emits `ns:vue-sfc-registry-update` only for `.vue` edits and for
++ * stylesheets an SFC's `<style>` depends on). Walk
+  * the reverse import graph to every `.vue` boundary, re-assemble each one
+  * (`loadSfcComponent` links the freshly re-imported deps) and reload its
+  * mounted instances in place, as the registry-update path does. Boundaries
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-change-kind.d.ts b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-change-kind.d.ts
+index 3a1c52d..20e4a10 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-change-kind.d.ts
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-change-kind.d.ts
+@@ -26,7 +26,9 @@ export type SfcSignatureStore = Map<string, string>;
+ /**
+  * A stable fingerprint of everything that would change a component's behavior
+  * rather than only its rendered output: both script blocks, their content and
+- * the attributes that alter how they compile.
++ * the attributes that alter how they compile, plus what the `<style>` blocks put
++ * into the component definition (`__scopeId`, `__cssModules`, `v-bind()`
++ * variables, `:slotted()` stamping). Style content alone stays render-only.
+  *
+  * Returns `null` when the SFC cannot be parsed — an unparseable save is never
+  * classified as render-only, because we cannot know what changed in it.
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-change-kind.js b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-change-kind.js
+index 3223492..46afa8a 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-change-kind.js
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-change-kind.js
+@@ -30,7 +30,9 @@ function loadParseSfc() {
+ /**
+  * A stable fingerprint of everything that would change a component's behavior
+  * rather than only its rendered output: both script blocks, their content and
+- * the attributes that alter how they compile.
++ * the attributes that alter how they compile, plus what the `<style>` blocks put
++ * into the component definition (`__scopeId`, `__cssModules`, `v-bind()`
++ * variables, `:slotted()` stamping). Style content alone stays render-only.
+  *
+  * Returns `null` when the SFC cannot be parsed — an unparseable save is never
+  * classified as render-only, because we cannot know what changed in it.
+@@ -52,7 +54,11 @@ export async function sfcScriptSignature(source, filename) {
+             // `lang` and `setup` change the compiled output for identical text.
+             return { lang: block.lang ?? '', setup: !!block.setup, content: block.content };
+         });
+-        return JSON.stringify(blocks);
++        // A rerender keeps the old `__cssModules` class map.
++        const cssModules = descriptor.styles.filter((block) => block.module).map((block) => ({ module: block.module, lang: block.lang ?? '', src: block.src ?? '', content: block.content }));
++        const scoped = descriptor.styles.some((block) => block.scoped);
++        // Slot content is stamped for `:slotted()` only while it mounts.
++        return JSON.stringify({ blocks, scoped, cssModules, slotted: descriptor.slotted, cssVars: descriptor.cssVars });
+     }
+     catch {
+         return null;
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-assemble.d.ts b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-assemble.d.ts
+index 476de3d..a9e645e 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-assemble.d.ts
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-assemble.d.ts
+@@ -1,5 +1,10 @@
+ import type { ViteDevServer } from 'vite';
+ import type { RegisterSfcHandlersOptions } from './sfc-route-shared.js';
++/**
++ * Drop every cached assembly. The cache key cannot see the stylesheets an SFC's `<style>`
++ * blocks depend on, so the Vue strategy calls this when a stylesheet changes.
++ */
++export declare function clearSfcAsmCache(): void;
+ /**
+  * Registers `GET /ns/asm` — the deterministic, self-contained SFC assembler module.
+  * Extracted verbatim from `websocket-sfc.ts` (pure move, no behavior change).
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-assemble.js b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-assemble.js
+index fabf833..bbf129f 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-assemble.js
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-assemble.js
+@@ -12,8 +12,8 @@ import { processCodeForDevice, rewriteImports } from '../../../server/websocket-
+ import { REQUIRE_GUARD_SNIPPET } from '../../../server/require-guard.js';
+ import { getServerOrigin } from '../../../server/server-origin.js';
+ import { resolveProjectTsAliasRelative } from '../../../../helpers/ts-config-paths.js';
+-import { canonicalizeNsMAppImports, compileScript, compileSfcStylesToCss, compileTemplate, parse, pluginTransformTypescript } from './sfc-route-shared.js';
+-import { buildCssRegisterSnippet } from '../../../server/css-device-module.js';
++import { canonicalizeNsMAppImports, compileScript, compileSfcStyles, compileTemplate, isProductionCompile, parse, pluginTransformTypescript, resolveSfcDescriptorId } from './sfc-route-shared.js';
++import { buildCssRegisterSnippet, buildCssUnregisterSnippet } from '../../../server/css-device-module.js';
+ // Cache assembled SFC modules keyed on `base | source-content-hash`.
+ // The source hash in the key means a changed SFC always produces a new key —
+ // stale output can never be served. This skips the full compile
+@@ -31,6 +31,17 @@ function setAsmCache(key, value) {
+             sfcAsmCache.delete(oldest);
+     }
+ }
++/**
++ * Drop every cached assembly. The cache key cannot see the stylesheets an SFC's `<style>`
++ * blocks depend on, so the Vue strategy calls this when a stylesheet changes.
++ */
++export function clearSfcAsmCache() {
++    sfcAsmCache.clear();
++}
++// Attached like `__hmrId`, so the Vue-HMR strip passes leave them alone.
++function buildComponentPropertySnippet(name, value) {
++    return `\n;try{ if (typeof __ns_sfc__ !== 'undefined' && __ns_sfc__) __ns_sfc__[${JSON.stringify(name)}] = ${JSON.stringify(value)}; }catch(__e){}\n`;
++}
+ /**
+  * Registers `GET /ns/asm` — the deterministic, self-contained SFC assembler module.
+  * Extracted verbatim from `websocket-sfc.ts` (pure move, no behavior change).
+@@ -88,9 +99,8 @@ export function registerSfcAsmRoute(server, options) {
+             };
+             const scriptR = await safeTransform(base + '?vue&type=script');
+             const templateR = await safeTransform(base + '?vue&type=template');
+-            // Warm Vite's transform cache for the full-SFC URL; result is unused (the
+-            // assembler reads the SFC from disk and compiles it inline below).
+-            await safeTransform(base + '?vue');
++            // plugin-vue's main transform: fills its descriptor cache, emits the id in `__hmrId`.
++            const mainR = await safeTransform(base);
+             const origin = getServerOrigin(server);
+             // All URLs minted into the assembled module are CANONICAL
+             // (unversioned): module identity is the URL. Freshness comes from
+@@ -100,6 +110,9 @@ export function registerSfcAsmRoute(server, options) {
+             // Compiled SFC <style> registration snippet, shared by the canonical and
+             // fallback emit paths below. Populated once the descriptor is parsed.
+             let sfcCssSnippet = '';
++            // `__scopeId` and `__cssModules` attach snippets, built with the css one.
++            let sfcScopeSnippet = '';
++            let sfcModulesSnippet = '';
+             // Stamps a stable, path-based `__hmrId` on the component so Vue's
+             // registerHMR auto-creates a record at mount — enabling in-place
+             // `__VUE_HMR_RUNTIME__.reload` on edit (preserves the App.vue shell /
+@@ -130,19 +143,32 @@ export function registerSfcAsmRoute(server, options) {
+                         return;
+                     }
+                     const { descriptor } = parse(sfcSrc, { filename: abs });
++                    // Styles are scoped with plugin-vue's descriptor id; script and template must match.
++                    const id = resolveSfcDescriptorId({ server, abs, mainCode: mainR?.code, source: sfcSrc });
++                    const hasScopedStyle = descriptor.styles.some((s) => s.scoped);
++                    const isProd = isProductionCompile(server);
+                     // Compile the SFC's <style> blocks and build the CSS-register snippet
+                     // appended below (HMR otherwise drops <style scoped> — only app.css
+                     // would apply).
+                     try {
+-                        const sfcCss = await compileSfcStylesToCss(descriptor, abs, projectRoot, !!options.verbose);
+-                        sfcCssSnippet = buildCssRegisterSnippet('sfc:' + base, sfcCss);
++                        const styleResult = await compileSfcStyles({ server, descriptor, base, abs, projectRoot, appVirtualWithSlash: options.appVirtualWithSlash, scopeId: id, verbose: !!options.verbose });
++                        if (styleResult.css.trim()) {
++                            sfcCssSnippet = buildCssRegisterSnippet('sfc:' + base, styleResult.css);
++                        }
++                        else if (!styleResult.failed) {
++                            // No rules left: drop the ones a previous version registered.
++                            sfcCssSnippet = buildCssUnregisterSnippet('sfc:' + base);
++                        }
++                        if (hasScopedStyle)
++                            sfcScopeSnippet = buildComponentPropertySnippet('__scopeId', 'data-v-' + id);
++                        if (styleResult.cssModules)
++                            sfcModulesSnippet = buildComponentPropertySnippet('__cssModules', styleResult.cssModules);
+                     }
+                     catch (eCss) {
+                         if (options.verbose) {
+                             console.warn('[sfc-asm][style] failed', base, eCss?.message);
+                         }
+                     }
+-                    const id = createHash('md5').update(abs).digest('hex').slice(0, 8);
+                     // 1) Compile script (prefer inlineTemplate for a complete module)
+                     let compiledScript = '';
+                     let bindingMetadata = undefined;
+@@ -154,6 +180,7 @@ export function registerSfcAsmRoute(server, options) {
+                         const isNSNative = (tag) => NS_NATIVE_TAGS.has(tag);
+                         const sInline = compileScript(descriptor, {
+                             id,
++                            isProd,
+                             inlineTemplate: true,
+                             reactivityTransform: false,
+                             // Pass only strict NS native element predicate; avoid broad PascalCase heuristic here.
+@@ -170,6 +197,7 @@ export function registerSfcAsmRoute(server, options) {
+                             // Fallback to standard script (no inline) and attempt separate template compile
+                             const s = compileScript(descriptor, {
+                                 id,
++                                isProd,
+                                 inlineTemplate: false,
+                                 reactivityTransform: false,
+                             });
+@@ -186,6 +214,7 @@ export function registerSfcAsmRoute(server, options) {
+                         try {
+                             const s = compileScript(descriptor, {
+                                 id,
++                                isProd,
+                                 inlineTemplate: false,
+                                 reactivityTransform: false,
+                             });
+@@ -213,6 +242,7 @@ export function registerSfcAsmRoute(server, options) {
+                         try {
+                             const sNoInline = compileScript(descriptor, {
+                                 id,
++                                isProd,
+                                 inlineTemplate: false,
+                                 reactivityTransform: false,
+                             });
+@@ -233,8 +263,11 @@ export function registerSfcAsmRoute(server, options) {
+                             const ct = compileTemplate({
+                                 source: tplSrc,
+                                 id,
++                                scoped: hasScopedStyle,
++                                // compiler-core treats an omitted `slotted` as true.
++                                slotted: !!descriptor.slotted,
+                                 filename: abs,
+-                                isProd: false,
++                                isProd,
+                                 ssr: false,
+                                 compilerOptions: {
+                                     bindingMetadata,
+@@ -706,6 +739,10 @@ export function registerSfcAsmRoute(server, options) {
+                             inlineCode2 += sfcCssSnippet;
+                         if (sfcHmrSnippet)
+                             inlineCode2 += sfcHmrSnippet;
++                        if (sfcScopeSnippet)
++                            inlineCode2 += sfcScopeSnippet;
++                        if (sfcModulesSnippet)
++                            inlineCode2 += sfcModulesSnippet;
+                         if (asmCacheKey)
+                             setAsmCache(asmCacheKey, inlineCode2);
+                         res.statusCode = 200;
+@@ -733,12 +770,14 @@ export function registerSfcAsmRoute(server, options) {
+                     const { descriptor } = parse(sfcSrc, { filename: abs });
+                     const tpl = descriptor.template?.content || '';
+                     if (tpl) {
+-                        const id = createHash('md5').update(abs).digest('hex').slice(0, 8);
++                        const id = resolveSfcDescriptorId({ server, abs, mainCode: mainR?.code, source: sfcSrc });
+                         const ct = compileTemplate({
+                             source: tpl,
+                             id,
++                            scoped: descriptor.styles.some((s) => s.scoped),
++                            slotted: !!descriptor.slotted,
+                             filename: abs,
+-                            isProd: false,
++                            isProd: isProductionCompile(server),
+                             ssr: false,
+                             compilerOptions: {
+                                 isCustomElement: (tag) => NS_NATIVE_TAGS.has(tag),
+@@ -809,6 +848,10 @@ export function registerSfcAsmRoute(server, options) {
+                 code += sfcCssSnippet;
+             if (sfcHmrSnippet)
+                 code += sfcHmrSnippet;
++            if (sfcScopeSnippet)
++                code += sfcScopeSnippet;
++            if (sfcModulesSnippet)
++                code += sfcModulesSnippet;
+             if (asmCacheKey)
+                 setAsmCache(asmCacheKey, code);
+             res.statusCode = 200;
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-meta.js b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-meta.js
+index 2e2bf76..8b7969d 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-meta.js
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-meta.js
+@@ -1,5 +1,8 @@
+ import { createHash } from 'crypto';
++import { readFileSync } from 'fs';
++import * as path from 'path';
+ import { extractExportMetadata } from '../../../server/websocket-served-module-helpers.js';
++import { parse, resolveSfcDescriptorId } from './sfc-route-shared.js';
+ /**
+  * Registers `GET /ns/sfc-meta` — JSON metadata (script exports, render presence,
+  * hmr id) for an SFC. Extracted verbatim from `websocket-sfc.ts` (pure move).
+@@ -38,8 +41,38 @@ export function registerSfcMetaRoute(server, options) {
+             if (!spec.startsWith('/'))
+                 spec = '/' + spec;
+             const base = spec.replace(/[?#].*$/, '');
+-            // Transform variants to inspect exports
+-            const [scriptR, templateR] = await Promise.all([server.transformRequest(base + '?vue&type=script'), server.transformRequest(base + '?vue&type=template')]);
++            // Inspect the variants' exports. An SFC without <script> has none.
++            const safeTransform = async (candidate) => {
++                try {
++                    return await server.transformRequest(candidate);
++                }
++                catch {
++                    return null;
++                }
++            };
++            const [scriptR, templateR] = await Promise.all([safeTransform(base + '?vue&type=script'), safeTransform(base + '?vue&type=template')]);
++            let styleMeta = { hasStyle: false, styleCount: 0, scoped: false, slotted: false, cssModules: false, cssVars: [], scopeId: null };
++            try {
++                const abs = path.join(server.config?.root || process.cwd(), base.replace(/^\//, ''));
++                const source = readFileSync(abs, 'utf-8');
++                const { descriptor } = parse(source, { filename: abs });
++                // `<style src>` blocks have no inline content.
++                const styles = descriptor.styles.filter((s) => s.src || s.content.trim());
++                const mainR = await safeTransform(base);
++                styleMeta = {
++                    hasStyle: styles.length > 0,
++                    styleCount: styles.length,
++                    scoped: styles.some((s) => s.scoped),
++                    slotted: descriptor.slotted,
++                    cssModules: styles.some((s) => s.module),
++                    cssVars: descriptor.cssVars,
++                    scopeId: resolveSfcDescriptorId({ server, abs, mainCode: mainR?.code, source }),
++                };
++            }
++            catch (eStyle) {
++                if (options.verbose)
++                    console.warn('[sfc-meta] style inspection failed for', base, eStyle?.message || String(eStyle));
++            }
+             const scriptCode = scriptR?.code || '';
+             const templateCode = templateR?.code || '';
+             const scriptMeta = extractExportMetadata(scriptCode);
+@@ -62,7 +95,7 @@ export function registerSfcMetaRoute(server, options) {
+                 path: base,
+                 hasScript: !!scriptCode,
+                 hasTemplate: !!templateCode,
+-                hasStyle: false,
++                ...styleMeta,
+                 scriptExports: scriptMeta.named,
+                 scriptHasDefault: scriptMeta.hasDefault,
+                 templateHasRender: hasRender,
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-serve.js b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-serve.js
+index 4c1956b..ce4d56b 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-serve.js
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-serve.js
+@@ -15,7 +15,7 @@ import { cleanCode, processCodeForDevice, rewriteImports } from '../../../server
+ import { REQUIRE_GUARD_SNIPPET } from '../../../server/require-guard.js';
+ import { getServerOrigin } from '../../../server/server-origin.js';
+ import { resolveProjectTsAliasRelative } from '../../../../helpers/ts-config-paths.js';
+-import { babelTraverse, canonicalizeNsMAppImports, compileScript, compileTemplate, parse, pluginTransformTypescript } from './sfc-route-shared.js';
++import { babelTraverse, canonicalizeNsMAppImports, compileScript, compileSfcStyles, compileTemplate, parse, pluginTransformTypescript } from './sfc-route-shared.js';
+ /**
+  * Registers `GET /ns/sfc` — serves SFC modules. Full SFCs delegate to the `/ns/asm`
+  * assembler; script/template variants are processed for device delivery. Extracted
+@@ -84,6 +84,36 @@ export function registerSfcServeRoute(server, options) {
+             const variantTypeMatch = /[?&]type=([^&]+)/.exec(fullSpec);
+             const variantType = variantTypeMatch?.[1] || null;
+             const isStyleVariant = /[?&]type=style\b/.test(fullSpec);
++            // Inspection only: /ns/asm registers the SFC's styles as a whole.
++            if (isStyleVariant) {
++                const basePath = fullSpec.replace(/[?#].*$/, '');
++                const index = Number(/[?&]index=(\d+)/.exec(fullSpec)?.[1] || 0);
++                const projectRootStyle = server.config?.root || process.cwd();
++                let css = '';
++                let scopeId = '';
++                let scoped = false;
++                try {
++                    const abs = path.join(projectRootStyle, basePath.replace(/^\//, ''));
++                    const { descriptor } = parse(readFileSync(abs, 'utf-8'), { filename: abs });
++                    let mainCode = '';
++                    try {
++                        mainCode = (await server.transformRequest(basePath))?.code || '';
++                    }
++                    catch { }
++                    const compiled = await compileSfcStyles({ server, descriptor, base: basePath, abs, projectRoot: projectRootStyle, appVirtualWithSlash: options.appVirtualWithSlash, mainCode, verbose: !!options.verbose, onlyIndex: index });
++                    css = compiled.css;
++                    scopeId = compiled.scopeId;
++                    scoped = !!descriptor.styles[index]?.scoped;
++                }
++                catch (eStyle) {
++                    if (options.verbose)
++                        console.warn('[sfc][serve][style] compile failed', fullSpec, eStyle?.message || String(eStyle));
++                }
++                const sig = `// [sfc] kind=variant:style path=${fullSpec.replace(/\n/g, '')} index=${index} scoped=${scoped} scopeId=${scopeId} len=${css.length} default=true\n`;
++                res.statusCode = 200;
++                res.end(`${sig}export default ${JSON.stringify(css)};\n`);
++                return;
++            }
+             // Determine candidate for transformRequest
+             // For full SFCs we prefer a clean base path + '?vue'; if that fails, try base without query as fallback.
+             let candidate = fullSpec;
+@@ -140,13 +170,6 @@ export function registerSfcServeRoute(server, options) {
+                     }
+                 }
+             }
+-            // For style variants, return an empty module immediately
+-            if (isStyleVariant) {
+-                const sig = `// [sfc] kind=variant:style path=${fullSpec.replace(/\n/g, '')} len=0 default=false\n`;
+-                res.statusCode = 200;
+-                res.end(`${sig}export {}\n`);
+-                return;
+-            }
+             let code = transformed.code;
+             // Prepend guard to capture any URL-based require attempts
+             code = REQUIRE_GUARD_SNIPPET + code;
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-shared.d.ts b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-shared.d.ts
+index 777dfd2..329cb5c 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-shared.d.ts
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-shared.d.ts
+@@ -1,3 +1,5 @@
++import type { ViteDevServer } from 'vite';
++import type { SFCDescriptor } from '@vue/compiler-sfc';
+ import type { FrameworkServerStrategy } from '../../../server/framework-strategy.js';
+ /**
+  * Plugin-closure dependencies the SFC route handlers need. The pure transform
+@@ -16,15 +18,76 @@ export interface RegisterSfcHandlersOptions {
+ export declare const babelTraverse: any;
+ export declare const parse: typeof import("@vue/compiler-sfc").parse, compileTemplate: typeof import("@vue/compiler-sfc").compileTemplate, compileScript: typeof import("@vue/compiler-sfc").compileScript, compileStyleAsync: typeof import("@vue/compiler-sfc").compileStyleAsync;
+ /**
+- * Compile an SFC descriptor's `<style>` blocks to one CSS string for the device
+- * (`scss`/`sass` via the app's `sass`; plain CSS passes through).
+- *
+- * Emitted UNSCOPED — the HMR template compile doesn't stamp `data-v-*` ids, so
+- * scoped selectors wouldn't match; NS components use uniquely-prefixed classes,
+- * so global application is equivalent. Returns `''` if there are no styles or
+- * every block fails (callers degrade gracefully).
++ * Whether @vitejs/plugin-vue compiles in production mode (its `isProduction`).
++ * @param server The dev server, whose resolved config plugin-vue reads.
++ * @returns True when plugin-vue compiles for production.
++ */
++export declare function isProductionCompile(server?: ViteDevServer): boolean;
++/**
++ * The `descriptor.id` @vitejs/plugin-vue assigns an SFC: the hash behind `data-v-<id>`,
++ * `__scopeId` and `v-bind()` variable names. Read from plugin-vue's main transform output,
++ * else recomputed the way its `createDescriptor` does without a custom `componentIdGenerator`.
++ * @param opts.server The dev server.
++ * @param opts.abs Absolute path of the SFC.
++ * @param opts.mainCode Output of plugin-vue's main transform of the SFC, if available.
++ * @param opts.source SFC source text.
++ * @returns The descriptor id.
++ */
++export declare function resolveSfcDescriptorId(opts: {
++    server?: ViteDevServer;
++    abs: string;
++    mainCode?: string;
++    source: string;
++}): string;
++/**
++ * Compiled `<style>` blocks of one SFC.
++ */
++export interface SfcStyleCompileResult {
++    /** Device css of every block, scoped selectors and `v-bind()` variables resolved. */
++    css: string;
++    /** Class maps of `<style module>` blocks by injection name (`$style`), to attach as `__cssModules`. */
++    cssModules: Record<string, Record<string, string>> | null;
++    /** The descriptor id the blocks were scoped with. */
++    scopeId: string;
++    /** Whether a block could not be read or compiled, so its rules are missing from `css`. */
++    failed: boolean;
++}
++/**
++ * Inputs of {@link compileSfcStyles}.
++ */
++export interface CompileSfcStylesOptions {
++    server?: ViteDevServer;
++    descriptor: SFCDescriptor;
++    /** Root-relative SFC path, e.g. `/src/Home.vue`. */
++    base: string;
++    abs: string;
++    projectRoot: string;
++    /** Root-relative app directory, e.g. `/src/`: the directory `~/` stands for. */
++    appVirtualWithSlash: string;
++    /** Descriptor id; resolved with {@link resolveSfcDescriptorId} when omitted. */
++    scopeId?: string;
++    mainCode?: string;
++    verbose?: boolean;
++    /** Compile only this block. */
++    onlyIndex?: number;
++}
++/**
++ * Compile an SFC's `<style>` blocks for the device. Each block goes through the Vite css pipeline
++ * with the sub-request @vitejs/plugin-vue emits (postcss, preprocessors, `@import`, scoping,
++ * `v-bind()`), falling back to `@vue/compiler-sfc`; `<style module>` blocks always compile with
++ * `@vue/compiler-sfc` to get their class map. The pipeline's dev-server `url()`s of app files
++ * are given back as `~/` urls. A block that fails to compile is skipped and sets `failed`.
++ * @param opts The SFC and how to compile it.
++ * @returns The device css, the css module class maps, the scope id and whether a block failed.
++ */
++export declare function compileSfcStyles(opts: CompileSfcStylesOptions): Promise<SfcStyleCompileResult>;
++/**
++ * The SFCs whose `<style>` blocks depend on a stylesheet (`@import`, `@use`, `<style src>`), as
++ * recorded by {@link compileSfcStyles}.
++ * @param file Absolute path of the stylesheet.
++ * @returns Root-relative SFC paths, e.g. `/src/Home.vue`.
+  */
+-export declare function compileSfcStylesToCss(descriptor: any, filename: string, projectRoot: string, verbose?: boolean): Promise<string>;
++export declare function getSfcsDependingOnStylesheet(file: string): string[];
+ export declare const pluginTransformTypescript: any;
+ /**
+  * Canonicalize app-source `/ns/m/` imports inside a served Vue SFC artifact
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-shared.js b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-shared.js
+index 6b52196..d56209c 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-shared.js
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/sfc-route-shared.js
+@@ -1,8 +1,10 @@
++import { createHash } from 'node:crypto';
++import { readFileSync } from 'node:fs';
+ import { createRequire } from 'node:module';
+ import * as path from 'path';
+ import traverse from '@babel/traverse';
+ import { vueSfcCompiler } from './compiler.js';
+-import { normalizeCssForDevice } from '../../../server/css-device-module.js';
++import { normalizeCssForDevice, renameDigitTerminatedScopedKeyframes } from '../../../server/css-device-module.js';
+ // Babel/Vue-compiler singletons shared by the SFC route modules (serve + assemble).
+ // Extracted verbatim from the former websocket-sfc.ts module scope so the routes
+ // resolve the exact same instances they did when they lived in one file.
+@@ -19,53 +21,238 @@ function getProjectRequire(projectRoot) {
+     }
+     return req;
+ }
++// @vitejs/plugin-vue's `attrsToQuery` ignore list.
++const STYLE_ATTR_IGNORE = new Set(['id', 'index', 'src', 'type', 'lang', 'module', 'scoped', 'generic']);
++// The style sub-request @vitejs/plugin-vue emits for a block, plus `&inline`.
++function buildSfcStyleRequest(requestBase, block, index, scopeId, src) {
++    let query = `?vue&type=style&index=${index}`;
++    if (src)
++        query += `&src=${src}`;
++    // `&inline` must precede `lang.<ext>`, which vite:css expects last.
++    query += '&inline';
++    if (block.scoped)
++        query += `&scoped=${scopeId}`;
++    for (const [name, value] of Object.entries(block.attrs)) {
++        if (STYLE_ATTR_IGNORE.has(name))
++            continue;
++        query += `&${encodeURIComponent(name)}${value ? `=${encodeURIComponent(String(value))}` : ''}`;
++    }
++    return `${requestBase}${query}&lang.${block.lang || 'css'}`;
++}
++function parseInlineCssExport(code) {
++    const match = code ? /export\s+default\s+("(?:[^"\\]|\\.)*")\s*;?/s.exec(code) : null;
++    if (!match)
++        return null;
++    try {
++        const css = JSON.parse(match[1]);
++        return typeof css === 'string' ? css : null;
++    }
++    catch {
++        return null;
++    }
++}
++const CSS_URL_RE = /(?<![\w-])url\(\s*(?:(["'])(.*?)\1|([^'"()\s]+))\s*\)/g;
++// Vite's dev url prefix for files under `dirUrl` (see its `fileToDevUrl`).
++function devServerUrlPrefix(server, dirUrl) {
++    const origin = (server.config?.server?.origin || '').replace(/\/+$/, '');
++    const base = (server.config?.base || '/').replace(/^\/*/, '/').replace(/\/*$/, '/');
++    return `${origin}${base}${dirUrl.replace(/^\/+/, '').replace(/\/*$/, '/')}`;
++}
++// Vite rebases `url()`s to dev-server paths; give app files back as `~/`.
++function restoreAppRootUrls(css, appUrlPrefix) {
++    if (!css.includes('url('))
++        return css;
++    return css.replace(CSS_URL_RE, (match, quote, quoted, bare) => {
++        const url = quoted ?? bare ?? '';
++        if (!url.startsWith(appUrlPrefix))
++            return match;
++        // Drop the `t=` query Vite adds to an asset after it hot-updates.
++        const rest = url.slice(appUrlPrefix.length).replace(/([?&])t=\d+(&|$)/, (_m, sep, next) => (next ? sep : ''));
++        return `url(${quote ?? ''}~/${rest}${quote ?? ''})`;
++    });
++}
++// `<style src>` resolves like plugin-vue's `linkSrcToDescriptor`: Vite's resolver, aliases included.
++async function resolveStyleSrc(server, src, importer) {
++    try {
++        const resolved = await server?.pluginContainer?.resolveId?.(src, importer);
++        if (resolved?.id && !resolved.external && path.isAbsolute(resolved.id))
++            return resolved.id.replace(/[?#].*$/, '');
++    }
++    catch { }
++    return path.resolve(path.dirname(importer), src);
++}
++// Vite's url for a file: root-relative inside the root, else `/@fs/`.
++function devRequestPath(projectRoot, file) {
++    const rel = path.relative(projectRoot, file);
++    if (rel && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel))
++        return '/' + rel.split(path.sep).join('/');
++    return '/@fs/' + file.split(path.sep).join('/').replace(/^\/+/, '');
++}
++// Stylesheet file → root-relative paths of SFCs whose styles depend on it.
++const styleDependencyIndex = new Map();
++function styleDependencyKey(file) {
++    return path.resolve(file).replace(/\\/g, '/');
++}
++function indexStyleDependency(file, base) {
++    const key = styleDependencyKey(file);
++    let bases = styleDependencyIndex.get(key);
++    if (!bases) {
++        bases = new Set();
++        styleDependencyIndex.set(key, bases);
++    }
++    bases.add(base);
++}
++// The files Vite's css pipeline read for a style sub-request (`@import`, `@use`).
++async function indexViteStyleDependencies(server, url, base) {
++    try {
++        const graph = server.environments?.client?.moduleGraph ?? server.moduleGraph;
++        const mod = await graph?.getModuleByUrl(url);
++        for (const dep of mod?.importedModules ?? []) {
++            if (dep.file)
++                indexStyleDependency(dep.file, base);
++        }
++    }
++    catch { }
++}
+ /**
+- * Compile an SFC descriptor's `<style>` blocks to one CSS string for the device
+- * (`scss`/`sass` via the app's `sass`; plain CSS passes through).
+- *
+- * Emitted UNSCOPED — the HMR template compile doesn't stamp `data-v-*` ids, so
+- * scoped selectors wouldn't match; NS components use uniquely-prefixed classes,
+- * so global application is equivalent. Returns `''` if there are no styles or
+- * every block fails (callers degrade gracefully).
++ * Whether @vitejs/plugin-vue compiles in production mode (its `isProduction`).
++ * @param server The dev server, whose resolved config plugin-vue reads.
++ * @returns True when plugin-vue compiles for production.
+  */
+-export async function compileSfcStylesToCss(descriptor, filename, projectRoot, verbose = false) {
+-    const styles = descriptor?.styles || [];
+-    if (!styles.length)
+-        return '';
++export function isProductionCompile(server) {
++    return server?.config?.isProduction ?? process.env.NODE_ENV === 'production';
++}
++/**
++ * The `descriptor.id` @vitejs/plugin-vue assigns an SFC: the hash behind `data-v-<id>`,
++ * `__scopeId` and `v-bind()` variable names. Read from plugin-vue's main transform output,
++ * else recomputed the way its `createDescriptor` does without a custom `componentIdGenerator`.
++ * @param opts.server The dev server.
++ * @param opts.abs Absolute path of the SFC.
++ * @param opts.mainCode Output of plugin-vue's main transform of the SFC, if available.
++ * @param opts.source SFC source text.
++ * @returns The descriptor id.
++ */
++export function resolveSfcDescriptorId(opts) {
++    const { server, abs, mainCode, source } = opts;
++    if (mainCode) {
++        const fromMain = /__hmrId\s*=\s*["']([0-9a-f]{6,})["']/.exec(mainCode) || /[?&]scoped=([0-9a-f]{6,})/.exec(mainCode);
++        if (fromMain)
++            return fromMain[1];
++    }
++    const root = server?.config?.root || process.cwd();
++    const rel = path.posix.normalize(path.relative(root, abs).split(path.sep).join('/'));
++    return createHash('sha256')
++        .update(isProductionCompile(server) ? rel + source : rel)
++        .digest('hex')
++        .slice(0, 8);
++}
++async function compileStyleBlockDirect(opts) {
++    const { block, filename, verbose } = opts;
++    const lang = (block.lang || '').toLowerCase();
++    const projectRequire = getProjectRequire(opts.projectRoot);
++    const res = await compileStyleAsync({
++        source: opts.source,
++        filename,
++        id: `data-v-${opts.scopeId}`,
++        scoped: !!block.scoped,
++        modules: !!block.module,
++        ...(block.module && opts.modulesOptions && typeof opts.modulesOptions === 'object' ? { modulesOptions: opts.modulesOptions } : {}),
++        isProd: opts.isProd,
++        ...(lang && lang !== 'css' ? { preprocessLang: lang, preprocessCustomRequire: (id) => projectRequire(id) } : {}),
++    });
++    if (res?.errors?.length && verbose) {
++        console.warn('[sfc-asm][style] compile errors', filename, res.errors.map((e) => e?.message || String(e)));
++    }
++    return { css: res?.code || '', modules: res?.modules || null, failed: !!res?.errors?.length, dependencies: Array.from(res?.dependencies ?? []) };
++}
++/**
++ * Compile an SFC's `<style>` blocks for the device. Each block goes through the Vite css pipeline
++ * with the sub-request @vitejs/plugin-vue emits (postcss, preprocessors, `@import`, scoping,
++ * `v-bind()`), falling back to `@vue/compiler-sfc`; `<style module>` blocks always compile with
++ * `@vue/compiler-sfc` to get their class map. The pipeline's dev-server `url()`s of app files
++ * are given back as `~/` urls. A block that fails to compile is skipped and sets `failed`.
++ * @param opts The SFC and how to compile it.
++ * @returns The device css, the css module class maps, the scope id and whether a block failed.
++ */
++export async function compileSfcStyles(opts) {
++    const { server, descriptor, base, abs, projectRoot, onlyIndex } = opts;
++    const verbose = !!opts.verbose;
++    const scopeId = opts.scopeId || resolveSfcDescriptorId({ server, abs, mainCode: opts.mainCode, source: descriptor.source });
++    const isProd = isProductionCompile(server);
++    const result = { css: '', cssModules: null, scopeId, failed: false };
+     const out = [];
+-    for (const style of styles) {
+-        const lang = String(style?.lang || '').toLowerCase();
+-        const source = style?.content || '';
+-        if (!source.trim())
++    for (let i = 0; i < descriptor.styles.length; i++) {
++        if (onlyIndex !== undefined && i !== onlyIndex)
+             continue;
+-        if (!lang || lang === 'css') {
+-            out.push(source);
++        const block = descriptor.styles[i];
++        const srcAbs = block.src ? await resolveStyleSrc(server, block.src, abs) : null;
++        let source = block.content;
++        if (srcAbs) {
++            indexStyleDependency(srcAbs, base);
++            try {
++                source = readFileSync(srcAbs, 'utf-8');
++            }
++            catch (e) {
++                if (verbose)
++                    console.warn('[sfc-asm][style] cannot read <style src>', srcAbs, e?.message || String(e));
++                result.failed = true;
++                continue;
++            }
++        }
++        if (!source.trim())
+             continue;
++        let css = null;
++        let modules = null;
++        if (!block.module && server) {
++            // `<style src>` blocks are requested under the stylesheet's own path.
++            const requestBase = srcAbs ? devRequestPath(projectRoot, srcAbs) : base;
++            const url = buildSfcStyleRequest(requestBase, block, i, scopeId, srcAbs ? (block.scoped ? scopeId : 'true') : null);
++            try {
++                css = parseInlineCssExport((await server.transformRequest(url))?.code);
++                if (css === null && verbose)
++                    console.warn('[sfc-asm][style] no inline css from', url);
++            }
++            catch (e) {
++                if (verbose)
++                    console.warn('[sfc-asm][style] vite pipeline failed, compiling directly', url, e?.message || String(e));
++            }
++            if (css !== null) {
++                css = restoreAppRootUrls(css, devServerUrlPrefix(server, opts.appVirtualWithSlash));
++                await indexViteStyleDependencies(server, url, base);
++            }
+         }
+-        try {
+-            const projectRequire = getProjectRequire(projectRoot);
+-            const res = await compileStyleAsync({
+-                source,
+-                filename,
+-                // `id` is required by the API but unused when `scoped` is false.
+-                id: 'data-v-nshmr',
+-                scoped: false,
+-                preprocessLang: lang,
+-                preprocessCustomRequire: (id) => projectRequire(id),
+-            });
+-            if (res?.errors?.length && verbose) {
+-                console.warn('[sfc-asm][style] preprocess errors', filename, res.errors.map((e) => e?.message || String(e)));
++        if (css === null) {
++            try {
++                const direct = await compileStyleBlockDirect({ block, source, filename: srcAbs || abs, projectRoot, scopeId, isProd, modulesOptions: server?.config?.css?.modules, verbose });
++                ({ css, modules } = direct);
++                result.failed || (result.failed = direct.failed);
++                for (const dep of direct.dependencies)
++                    indexStyleDependency(dep, base);
++            }
++            catch (e) {
++                if (verbose)
++                    console.warn('[sfc-asm][style] compile failed', base, i, e?.message || String(e));
++                result.failed = true;
++                continue;
+             }
+-            if (res?.code)
+-                out.push(res.code);
+         }
+-        catch (e) {
+-            if (verbose)
+-                console.warn('[sfc-asm][style] compile failed', filename, e?.message || String(e));
++        if (css.trim())
++            out.push(css);
++        if (modules && block.module) {
++            (result.cssModules || (result.cssModules = {}))[typeof block.module === 'string' ? block.module : '$style'] = modules;
+         }
+     }
+-    // Normalize for the device CSS engine (strip BOM / @charset).
+-    return normalizeCssForDevice(out.join('\n'));
++    result.css = renameDigitTerminatedScopedKeyframes(normalizeCssForDevice(out.join('\n')));
++    return result;
++}
++/**
++ * The SFCs whose `<style>` blocks depend on a stylesheet (`@import`, `@use`, `<style src>`), as
++ * recorded by {@link compileSfcStyles}.
++ * @param file Absolute path of the stylesheet.
++ * @returns Root-relative SFC paths, e.g. `/src/Home.vue`.
++ */
++export function getSfcsDependingOnStylesheet(file) {
++    return Array.from(styleDependencyIndex.get(styleDependencyKey(file)) ?? []);
+ }
+ export const pluginTransformTypescript = (() => {
+     const requireFromHere = createRequire(import.meta.url);
+diff --git a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/strategy.js b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/strategy.js
+index 0a8046e..79c4921 100644
+--- a/node_modules/@nativescript/vite/hmr/frameworks/vue/server/strategy.js
++++ b/node_modules/@nativescript/vite/hmr/frameworks/vue/server/strategy.js
+@@ -4,7 +4,10 @@ import * as path from 'path';
+ import * as PAT from '../../../server/constants.js';
+ import { rewriteVendorVueSpec } from '../../../helpers/vendor-rewrite.js';
+ import { getProjectAppPath } from '../../../../helpers/utils.js';
++import { isWithinHmrScope } from '../../../../helpers/hmr-scope.js';
+ import { runHotUpdatePrologue } from '../../../server/websocket-hot-update.js';
++import { CSS_MODULE_RE } from '../../../server/css-device-module.js';
++import { isRuntimeGraphExcludedPath } from '../../../server/runtime-graph-filter.js';
+ import { cleanCode, collectImportDependencies, processCodeForDevice, rewriteImports } from '../../../server/websocket-device-transform.js';
+ import { isCoreGlobalsReference, isNativeScriptCoreModule, isNativeScriptPluginModule, resolveVendorFromCandidate } from '../../../server/websocket-module-specifiers.js';
+ import { ensureRoutesDefaultExport } from '../../../server/websocket-served-module-helpers.js';
+@@ -290,6 +293,122 @@ async function buildAndSendRegistry(ctx) {
+         console.log(`[registry] Sent ${entries.length} SFC entries`);
+     }
+ }
++// Stylesheets whose current edit only SFC `<style>` blocks consume.
++const sfcOwnedStylesheetEdits = new Set();
++// Inline (`X.vue?vue&type=style…`) and `<style src>` (`x.css?vue&type=style…`) sub-requests.
++const STYLE_SUBREQUEST_RE = /[?&]vue&type=style\b/;
++const STYLESHEET_IMPORT_MAX_DEPTH = 8;
++// `sfcOnly`: every known importer of the file is an SFC style block.
++async function collectSfcsAffectedByStylesheet(server, file) {
++    const root = server.config.root || process.cwd();
++    const { getSfcsDependingOnStylesheet } = await import('./sfc-route-shared.js');
++    const affected = new Set(getSfcsDependingOnStylesheet(file));
++    let sawImporter = false;
++    let sawOtherImporter = false;
++    const addOwner = (ownerFile) => {
++        const rel = '/' + path.posix.normalize(path.relative(root, ownerFile)).split(path.sep).join('/');
++        if (!rel.startsWith('/..'))
++            affected.add(rel);
++    };
++    // Inline sub-requests are the SFC's file; it imports `<style src>` ones.
++    const addStyleSubrequestOwner = (mod) => {
++        if (mod.file && PAT.VUE_FILE_PATTERN.test(mod.file)) {
++            addOwner(mod.file);
++            return;
++        }
++        for (const importer of mod.importers ?? []) {
++            sawImporter = true;
++            if (importer.file && PAT.VUE_FILE_PATTERN.test(importer.file))
++                addOwner(importer.file);
++            else
++                sawOtherImporter = true;
++        }
++    };
++    const visited = new Set();
++    const walk = (mod, depth) => {
++        if (visited.has(mod) || depth > STYLESHEET_IMPORT_MAX_DEPTH)
++            return;
++        visited.add(mod);
++        if (STYLE_SUBREQUEST_RE.test(mod.url || '')) {
++            addStyleSubrequestOwner(mod);
++            return;
++        }
++        for (const importer of mod.importers ?? []) {
++            sawImporter = true;
++            if (STYLE_SUBREQUEST_RE.test(importer.url || ''))
++                addStyleSubrequestOwner(importer);
++            else if (CSS_MODULE_RE.test(importer.url || ''))
++                walk(importer, depth + 1);
++            else
++                sawOtherImporter = true;
++        }
++    };
++    const graph = server.environments?.client?.moduleGraph ?? server.moduleGraph;
++    for (const mod of graph?.getModulesByFile(file) ?? [])
++        walk(mod, 0);
++    return { affected: Array.from(affected), sfcOnly: affected.size > 0 && sawImporter && !sawOtherImporter };
++}
++// The assembler cache key cannot see stylesheet dependencies.
++async function prepareStylesheetHotUpdate(server, file, deps) {
++    const { verbose } = deps;
++    try {
++        (await import('./sfc-route-assemble.js')).clearSfcAsmCache();
++        // The prologue's gates: no device update without its `ns:hmr-pending`.
++        if (!deps.wss || isRuntimeGraphExcludedPath(file) || !isWithinHmrScope(file, deps.getHmrSourceRootsCached()))
++            return [];
++        const { affected, sfcOnly } = await collectSfcsAffectedByStylesheet(server, file);
++        if (sfcOnly)
++            sfcOwnedStylesheetEdits.add(file);
++        if (verbose && affected.length)
++            console.log(`[hmr-ws] stylesheet ${file} → re-assembling ${affected.join(', ')}${sfcOnly ? ' (SFC styles only, no css broadcast)' : ''}`);
++        return affected;
++    }
++    catch (error) {
++        if (verbose)
++            console.warn('[hmr-ws] stylesheet → SFC propagation failed', error);
++        return [];
++    }
++}
++// A rerender keeps the old `__cssModules` class map, so those SFCs reload.
++async function canRerenderStyleChange(root, rel) {
++    try {
++        const { parse } = await import('./sfc-route-shared.js');
++        const abs = path.join(root, rel.replace(/^\//, ''));
++        return !parse(readFileSync(abs, 'utf-8'), { filename: abs }).descriptor.styles.some((block) => block.module);
++    }
++    catch {
++        return false;
++    }
++}
++async function broadcastStylesheetDependents(rels, server, deps) {
++    const { wss, moduleGraph, sfcFileMap, isSocketClientOpen } = deps;
++    if (!wss)
++        return;
++    const root = server.config.root || process.cwd();
++    const ts = Date.now();
++    for (const rel of rels) {
++        const hash = createHash('md5').update(rel).digest('hex').slice(0, 8);
++        const fileName = sfcFileMap.get(rel) || `sfc-${hash}.mjs`;
++        sfcFileMap.set(rel, fileName);
++        const msg = {
++            type: 'ns:vue-sfc-registry-update',
++            path: rel,
++            fileName,
++            ts,
++            version: moduleGraph.version,
++            rerenderOnly: await canRerenderStyleChange(root, rel),
++        };
++        const payload = JSON.stringify(msg);
++        wss.clients.forEach((client) => {
++            if (isSocketClientOpen(client)) {
++                try {
++                    client.send(payload);
++                }
++                catch { }
++            }
++        });
++    }
++}
+ export const vueServerStrategy = {
+     flavor: 'vue',
+     matchesFile(id) {
+@@ -300,9 +419,15 @@ export const vueServerStrategy = {
+     // changed `.vue` SFC — re-transform + clean it, register its nested `.vue`
+     // imports in the SFC map, and broadcast a metadata-only registry update so the
+     // device re-fetches the SFC artifact over HTTP. Non-`.vue` edits fall through
+-    // (the prologue already handled CSS / the common graph delta).
++    // (the prologue already handled CSS / the common graph delta). A stylesheet
++    // edit also re-assembles every SFC whose `<style>` blocks depend on it.
+     async handleHotUpdate(ctx, deps) {
++        sfcOwnedStylesheetEdits.delete(ctx.file);
++        const styleDependents = CSS_MODULE_RE.test(ctx.file) ? await prepareStylesheetHotUpdate(ctx.server, ctx.file, deps) : [];
+         const state = await runHotUpdatePrologue(ctx, deps);
++        // After the prologue's `ns:hmr-pending`, like a `.vue` edit's registry update.
++        if (styleDependents.length)
++            await broadcastStylesheetDependents(styleDependents, ctx.server, deps);
+         if (!state)
+             return;
+         const { emitSummary } = state;
+@@ -526,6 +651,10 @@ if (typeof __VUE_HMR_RUNTIME__ === 'undefined') {
+         // CRITICAL: Return empty array to prevent Vite's default HMR
+         return [];
+     },
++    // Claimed once per edit; the re-assembled SFCs register the scoped css.
++    ownsComponentStyleHmr(_server, file) {
++        return sfcOwnedStylesheetEdits.delete(file);
++    },
+     preClean(code) {
+         let result = code;
+         result = result.replace(PAT.VUE_STYLE_IMPORTS, '');
+diff --git a/node_modules/@nativescript/vite/hmr/server/boot-recording.d.ts b/node_modules/@nativescript/vite/hmr/server/boot-recording.d.ts
+index e30d6a2..bf1b3eb 100644
+--- a/node_modules/@nativescript/vite/hmr/server/boot-recording.d.ts
++++ b/node_modules/@nativescript/vite/hmr/server/boot-recording.d.ts
+@@ -37,7 +37,7 @@ export type BootRecorder = {
+      * response status code; only 2xx completions are recorded.
+      */
+     noteRequest(pathWithSearch: string): ((statusCode: number) => void) | null;
+-    /** Most recent completed (or persisted) recording; null when none. */
++    /** Union of completed (and persisted) recordings, newest first; null when none. */
+     getRecordedPaths(): string[] | null;
+     /** Force-close the active session (idle close path; exposed for tests). */
+     closeActiveSession(): void;
+diff --git a/node_modules/@nativescript/vite/hmr/server/boot-recording.js b/node_modules/@nativescript/vite/hmr/server/boot-recording.js
+index 3f53ca3..552a400 100644
+--- a/node_modules/@nativescript/vite/hmr/server/boot-recording.js
++++ b/node_modules/@nativescript/vite/hmr/server/boot-recording.js
+@@ -14,14 +14,18 @@ import { getProjectFlavor } from '../../helpers/flavor.js';
+ // Lifecycle: a recording session opens when the device fetches the session
+ // descriptor (`/__ns_dev__/session` — requested exactly once per boot by the
+ // session bootstrap), collects every successfully-served prefetchable
+-// request, and closes after an idle window. Closed sessions replace the
+-// previous recording and persist to
++// request, and closes after an idle window. Closed sessions are merged into
++// the previous recording and persist to
+ // `node_modules/.ns-vite/boot-closure-<platform>-<flavor>.json` so a fresh
+ // dev-server start benefits too.
+ //
+-// Self-healing: only 2xx responses are recorded, so deleted modules (404s)
+-// drop out on the next boot. Stale-but-servable entries are harmless — the
+-// deps bundle simply carries an unused entry until the next recording.
++// Staleness: only 2xx responses are recorded, and the deps bundle skips
++// recorded files that no longer resolve on disk. A recorded URL stays until
++// the `maxEntries` cap pushes it out (least recently requested first) or the
++// recording file is deleted. Until then, a recorded node_modules file that
++// still resolves stays a deps-bundle entry and evaluates at boot, even after
++// the app stops importing it. If a deps-bundle build with the recording
++// fails, the bundle is rebuilt without it.
+ export const BOOT_RECORDING_VERSION = 1;
+ /** Endpoints whose request marks the start of a device boot. */
+ export const BOOT_SIGNAL_PATHS = new Set(['/__ns_dev__/session']);
+@@ -135,7 +139,11 @@ export function createBootRecorder(options) {
+             log(`[hmr-ws][boot-record] discarded window with ${finished.order.length} entries (< ${minEntries})`);
+             return;
+         }
+-        best = finished.order.slice(0, maxEntries);
++        // A boot that fails early must not shrink the recording.
++        const merged = new Set(finished.order);
++        for (const recorded of best ?? [])
++            merged.add(recorded);
++        best = Array.from(merged).slice(0, maxEntries);
+         persistBest();
+         log(`[hmr-ws][boot-record] captured ${best.length} boot urls in ${Math.max(0, now() - finished.startedAt)}ms`);
+     };
+diff --git a/node_modules/@nativescript/vite/hmr/server/constants.js b/node_modules/@nativescript/vite/hmr/server/constants.js
+index af7263b..fee91be 100644
+--- a/node_modules/@nativescript/vite/hmr/server/constants.js
++++ b/node_modules/@nativescript/vite/hmr/server/constants.js
+@@ -38,7 +38,8 @@ export const VITE_CLIENT_IMPORT = /(^|[\n;])\s*import\s+(?:[\w$]+\s*,\s*)?(?:\{[
+ export const IMPORT_META_HOT_ASSIGNMENT = /\bimport\.meta\.hot\s*=\s*[^;\n]+;?/g;
+ export const IMPORT_META_HOT_CALLS = /(?:^|\n)\s*import\.meta\.hot\.[A-Za-z_$][\w$]*\([^)]*\);?\s*/g;
+ // Remove only Vue style virtual imports; keep script/template variants
+-export const VUE_STYLE_IMPORTS = /(?:^|\n)\s*import\s+['"][^'"\n]*\.vue\?type=style[^'"\n]*['"];?/g;
++// @vitejs/plugin-vue emits `.vue?vue&type=style&index=N…`.
++export const VUE_STYLE_IMPORTS = /(?:^|\n)\s*import\s+['"][^'"\n]*\.vue\?(?:vue&)?type=style[^'"\n]*['"];?/g;
+ export const VUE_EXPORT_SFC_IMPORT = /(?:^|\n)\s*import\s+[^;\n]*__vite-plugin-vue_export-helper[^;\n]*;?/g;
+ export const VUE_VIRTUAL_ID_IMPORT = /(?:^|\n)\s*import\s+[^;\n]*\/@id\/[^'"\n]*;?/g;
+ //# sourceMappingURL=constants.js.map
+\ No newline at end of file
+diff --git a/node_modules/@nativescript/vite/hmr/server/content-css-update.js b/node_modules/@nativescript/vite/hmr/server/content-css-update.js
+index d40cdbc..954376c 100644
+--- a/node_modules/@nativescript/vite/hmr/server/content-css-update.js
++++ b/node_modules/@nativescript/vite/hmr/server/content-css-update.js
+@@ -1,6 +1,6 @@
+ import * as path from 'path';
+ import { getAppCssState } from '../../helpers/app-css-state.js';
+-import { appCssRootRelPath, buildCssUpdateItem, buildCssUpdatesMessage } from './css-update-message.js';
++import { appCssRootRelPath, buildCssUpdateItem, buildCssUpdatesMessage, loadCssUpdateText } from './css-update-message.js';
+ /**
+  * Tailwind / content-scanning CSS routing for non-CSS edits.
+  *
+@@ -49,7 +49,8 @@ export async function processContentCssUpdate(opts) {
+     if (!appCssRel) {
+         return none;
+     }
+-    const update = buildCssUpdateItem(appCssRel);
++    const cssText = await loadCssUpdateText(server, appCssRel, { verbose });
++    const update = buildCssUpdateItem(appCssRel, { cssText });
+     if (deferToFrameworkUpdate) {
+         if (verbose)
+             console.info(`[ns-hmr][server] Tailwind/PostCSS output changed after ${path.basename(file)}; deferred ${appCssRel} to framework update`);
+diff --git a/node_modules/@nativescript/vite/hmr/server/css-connect-sync.js b/node_modules/@nativescript/vite/hmr/server/css-connect-sync.js
+index b9c8e51..55ca698 100644
+--- a/node_modules/@nativescript/vite/hmr/server/css-connect-sync.js
++++ b/node_modules/@nativescript/vite/hmr/server/css-connect-sync.js
+@@ -1,5 +1,5 @@
+ import { getAppCssState } from '../../helpers/app-css-state.js';
+-import { appCssRootRelPath, buildCssUpdateItem, buildCssUpdatesMessage } from './css-update-message.js';
++import { appCssRootRelPath, buildCssUpdateItem, buildCssUpdatesMessage, loadCssUpdateText } from './css-update-message.js';
+ import { isSocketClientOpen } from './socket-utils.js';
+ /**
+  * Boot-time stylesheet sync for freshly connected full HMR clients.
+@@ -44,7 +44,11 @@ export async function maybeSendConnectCssSync(server, ws, opts = {}) {
+     if (!isSocketClientOpen(ws)) {
+         return false;
+     }
+-    const msg = buildCssUpdatesMessage(server, [buildCssUpdateItem(appCssRel)], { reason: 'connect-sync' });
++    const cssText = await loadCssUpdateText(server, appCssRel, { verbose: opts.verbose });
++    if (!isSocketClientOpen(ws)) {
++        return false;
++    }
++    const msg = buildCssUpdatesMessage(server, [buildCssUpdateItem(appCssRel, { cssText })], { reason: 'connect-sync' });
+     try {
+         ws.send(JSON.stringify(msg));
+     }
+diff --git a/node_modules/@nativescript/vite/hmr/server/css-device-module.d.ts b/node_modules/@nativescript/vite/hmr/server/css-device-module.d.ts
+index 1ea7aa4..7fa914b 100644
+--- a/node_modules/@nativescript/vite/hmr/server/css-device-module.d.ts
++++ b/node_modules/@nativescript/vite/hmr/server/css-device-module.d.ts
+@@ -17,8 +17,22 @@ export declare const CSS_MODULE_RE: RegExp;
+  * NativeScript's styling engine has no use for either.
+  */
+ export declare function normalizeCssForDevice(css: string): string;
++/**
++ * Append a letter to each Vue scoped keyframes name (`<name>-<8 hex>`) that ends
++ * in a digit, in its `@keyframes` rule and in every reference to it. Core's
++ * `animation:` shorthand parser takes such a name for the iteration count; drop
++ * this once that parser anchors its token patterns.
++ * @param css Compiled css text.
++ * @returns The css with those keyframes renamed.
++ */
++export declare function renameDigitTerminatedScopedKeyframes(css: string): string;
+ /** Register a CSS string literal under `tag`. `''` for empty CSS. */
+ export declare function buildCssRegisterSnippet(tag: string, cssText: string): string;
++/**
++ * Register `''` under `tag`, which the device appliers take as "drop this tag's rules".
++ * @param tag The tag the source registered its css under.
++ */
++export declare function buildCssUnregisterSnippet(tag: string): string;
+ /**
+  * Register CSS held in an in-scope module variable under `tag`. Used by the
+  * generic `.css` handler (reuses Vite's `?inline` binding). For an imported file
+diff --git a/node_modules/@nativescript/vite/hmr/server/css-device-module.js b/node_modules/@nativescript/vite/hmr/server/css-device-module.js
+index 0d7cd96..257a566 100644
+--- a/node_modules/@nativescript/vite/hmr/server/css-device-module.js
++++ b/node_modules/@nativescript/vite/hmr/server/css-device-module.js
+@@ -22,6 +22,33 @@ export function normalizeCssForDevice(css) {
+         return '';
+     return css.replace(/^﻿/, '').replace(/@charset\s+["'][^"']*["'];?\s*/gi, '');
+ }
++// Vue's scoped transform renames `@keyframes x` to `x-<8 hex scope id>`.
++const SCOPED_KEYFRAMES_RE = /@(?:-webkit-)?keyframes\s+([A-Za-z_][\w-]*-[0-9a-f]{8})(?![\w-])/g;
++function escapeRegExp(text) {
++    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++}
++/**
++ * Append a letter to each Vue scoped keyframes name (`<name>-<8 hex>`) that ends
++ * in a digit, in its `@keyframes` rule and in every reference to it. Core's
++ * `animation:` shorthand parser takes such a name for the iteration count; drop
++ * this once that parser anchors its token patterns.
++ * @param css Compiled css text.
++ * @returns The css with those keyframes renamed.
++ */
++export function renameDigitTerminatedScopedKeyframes(css) {
++    if (!css || !css.includes('keyframes'))
++        return css;
++    const renames = new Map();
++    for (const match of css.matchAll(SCOPED_KEYFRAMES_RE)) {
++        if (/\d$/.test(match[1]))
++            renames.set(match[1], `${match[1]}x`);
++    }
++    let out = css;
++    for (const [from, to] of renames) {
++        out = out.replace(new RegExp(`(^|[^\\w-])${escapeRegExp(from)}(?![\\w-])`, 'g'), `$1${to}`);
++    }
++    return out;
++}
+ // Device-safe IIFE: apply via the client applier, else queue for drain-on-install.
+ function buildRegisterCall(tagExpr, cssExpr) {
+     return `\n;(function(){try{var g=globalThis;var __t=${tagExpr};var __c=${cssExpr};var __r=g.__NS_REGISTER_CSS__;if(typeof __r==='function'){__r(__t,__c);}else{(g.__NS_PENDING_CSS__=g.__NS_PENDING_CSS__||{})[__t]=__c;}}catch(__e){}})();\n`;
+@@ -32,6 +59,13 @@ export function buildCssRegisterSnippet(tag, cssText) {
+         return '';
+     return buildRegisterCall(JSON.stringify(tag), JSON.stringify(cssText));
+ }
++/**
++ * Register `''` under `tag`, which the device appliers take as "drop this tag's rules".
++ * @param tag The tag the source registered its css under.
++ */
++export function buildCssUnregisterSnippet(tag) {
++    return buildRegisterCall(JSON.stringify(tag), '""');
++}
+ /**
+  * Register CSS held in an in-scope module variable under `tag`. Used by the
+  * generic `.css` handler (reuses Vite's `?inline` binding). For an imported file
+diff --git a/node_modules/@nativescript/vite/hmr/server/css-update-message.d.ts b/node_modules/@nativescript/vite/hmr/server/css-update-message.d.ts
+index fa4b400..b0b6868 100644
+--- a/node_modules/@nativescript/vite/hmr/server/css-update-message.d.ts
++++ b/node_modules/@nativescript/vite/hmr/server/css-update-message.d.ts
+@@ -17,7 +17,18 @@ export declare function appCssRootRelPath(root: string, appCssAbsPath: string):
+ export declare function buildCssUpdateItem(cssPath: string, opts?: {
+     tag?: string;
+     timestamp?: number;
++    cssText?: string | null;
+ }): CssUpdateItem;
++/**
++ * Compiles a root-relative stylesheet the way the dev server answers the device's `<path>?direct=1` fetch.
++ * @param server The Vite dev server.
++ * @param cssPath Root-relative stylesheet path, as broadcast in the `css-update` item.
++ * @param opts `verbose` logs transform failures.
++ * @returns The device-ready css, or `null` when neither the `?direct` nor the `?inline` transform yields css.
++ */
++export declare function loadCssUpdateText(server: ViteDevServer, cssPath: string, opts?: {
++    verbose?: boolean;
++}): Promise<string | null>;
+ export declare function buildCssUpdatesMessage(server: ViteDevServer, updates: CssUpdateItem[], opts?: {
+     reason?: 'connect-sync';
+ }): CssUpdatesMessage;
+diff --git a/node_modules/@nativescript/vite/hmr/server/css-update-message.js b/node_modules/@nativescript/vite/hmr/server/css-update-message.js
+index f4c957c..9444fb9 100644
+--- a/node_modules/@nativescript/vite/hmr/server/css-update-message.js
++++ b/node_modules/@nativescript/vite/hmr/server/css-update-message.js
+@@ -1,5 +1,6 @@
+ import * as path from 'path';
+ import { getServerOrigin } from './server-origin.js';
++import { normalizeCssForDevice } from './css-device-module.js';
+ /**
+  * Canonical helpers for the `ns:css-updates` wire message. Every server-side
+  * emitter (the `.css`-edit branch of the hot-update prologue, the Tailwind
+@@ -28,8 +29,47 @@ export function buildCssUpdateItem(cssPath, opts = {}) {
+         acceptedPath: cssPath,
+         timestamp: opts.timestamp ?? Date.now(),
+         ...(opts.tag ? { tag: opts.tag } : {}),
++        ...(typeof opts.cssText === 'string' ? { cssText: opts.cssText } : {}),
+     };
+ }
++/**
++ * Compiles a root-relative stylesheet the way the dev server answers the device's `<path>?direct=1` fetch.
++ * @param server The Vite dev server.
++ * @param cssPath Root-relative stylesheet path, as broadcast in the `css-update` item.
++ * @param opts `verbose` logs transform failures.
++ * @returns The device-ready css, or `null` when neither the `?direct` nor the `?inline` transform yields css.
++ */
++export async function loadCssUpdateText(server, cssPath, opts = {}) {
++    const withQuery = (query) => `${cssPath}${cssPath.includes('?') ? '&' : '?'}${query}`;
++    try {
++        const direct = await server.transformRequest(withQuery('direct'));
++        const code = direct?.code;
++        // Plain css only; a js module shape falls through to `?inline`.
++        if (typeof code === 'string' && code.length && !/^\s*(?:import|export)\b/.test(code)) {
++            return normalizeCssForDevice(code);
++        }
++    }
++    catch (error) {
++        if (opts.verbose)
++            console.warn('[hmr-ws] css ?direct transform failed for', cssPath, error?.message || String(error));
++    }
++    try {
++        const inline = await server.transformRequest(withQuery('inline'));
++        // `?inline` output is `export default "<compiled css>"`.
++        const match = /export\s+default\s+("(?:[^"\\]|\\.)*")\s*;?/s.exec(inline?.code || '');
++        if (match) {
++            const css = JSON.parse(match[1]);
++            if (typeof css === 'string') {
++                return normalizeCssForDevice(css);
++            }
++        }
++    }
++    catch (error) {
++        if (opts.verbose)
++            console.warn('[hmr-ws] css ?inline transform failed for', cssPath, error?.message || String(error));
++    }
++    return null;
++}
+ export function buildCssUpdatesMessage(server, updates, opts = {}) {
+     return {
+         type: 'ns:css-updates',
+diff --git a/node_modules/@nativescript/vite/hmr/server/deps-bundle.d.ts b/node_modules/@nativescript/vite/hmr/server/deps-bundle.d.ts
+index 01da726..774258f 100644
+--- a/node_modules/@nativescript/vite/hmr/server/deps-bundle.d.ts
++++ b/node_modules/@nativescript/vite/hmr/server/deps-bundle.d.ts
+@@ -46,9 +46,11 @@
+  *
+  * FALLBACK
+  * --------
+- * A failed esbuild build logs once and falls back to per-module serving plus
+- * the standalone vendor bundle for the session. Opt out entirely with
+- * `NS_DEPS_PER_MODULE=1` (patch-package workflows editing node_modules).
++ * A build that fails with recorded entries is retried once without them (the
++ * vendor collection alone). A failed esbuild build logs once and falls back to
++ * per-module serving plus the standalone vendor bundle for the session. Opt
++ * out entirely with `NS_DEPS_PER_MODULE=1` (patch-package workflows editing
++ * node_modules).
+  */
+ import type { ViteDevServer } from 'vite';
+ import type { Platform } from '../../helpers/platform-types.js';
+@@ -138,6 +140,13 @@ export interface GenerateDepsBundleOptions {
+     verbose?: boolean;
+     recordedPaths: readonly string[];
+ }
++/**
++ * Fingerprints the patch files that change installed dependencies without changing the lockfile: `patchedDependencies` and `pnpm.patchedDependencies` entries plus patch-package's `patches/*.patch`, of the app and the workspace root, by mtime and size.
++ * @param projectRoot app root
++ * @param workspaceRoot monorepo workspace root, or null outside a monorepo
++ * @returns a stable fingerprint, `none` when there are no patches
++ */
++export declare function patchedDependenciesFingerprint(projectRoot: string, workspaceRoot: string | null): string;
+ export declare function computeDepsBundleCacheKey(input: {
+     platform: string;
+     mode: string;
+@@ -145,6 +154,7 @@ export declare function computeDepsBundleCacheKey(input: {
+     defines: Record<string, string>;
+     entryKeys: readonly string[];
+     lockfile: string;
++    patches?: string;
+     vitePackageVersion: string;
+ }): string;
+ export declare function tryLoadDepsBundleFromDisk(projectRoot: string, platform: string, key: string): DepsBundleState | null;
+diff --git a/node_modules/@nativescript/vite/hmr/server/deps-bundle.js b/node_modules/@nativescript/vite/hmr/server/deps-bundle.js
+index 395c29e..3261547 100644
+--- a/node_modules/@nativescript/vite/hmr/server/deps-bundle.js
++++ b/node_modules/@nativescript/vite/hmr/server/deps-bundle.js
+@@ -46,9 +46,11 @@
+  *
+  * FALLBACK
+  * --------
+- * A failed esbuild build logs once and falls back to per-module serving plus
+- * the standalone vendor bundle for the session. Opt out entirely with
+- * `NS_DEPS_PER_MODULE=1` (patch-package workflows editing node_modules).
++ * A build that fails with recorded entries is retried once without them (the
++ * vendor collection alone). A failed esbuild build logs once and falls back to
++ * per-module serving plus the standalone vendor bundle for the session. Opt
++ * out entirely with `NS_DEPS_PER_MODULE=1` (patch-package workflows editing
++ * node_modules).
+  */
+ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+ import * as path from 'node:path';
+@@ -67,7 +69,7 @@ import { collectVendorModules } from '../shared/vendor/manifest-collect.js';
+ import { generatePlatformPolyfills } from '../shared/runtime/platform-polyfills.js';
+ import { getAngularLinkerFactory, runAngularLinker } from '../frameworks/angular/build/shared-linker.js';
+ import { getBlockedDeviceNodeModulesReason, isFlavorClientPackageSpecifier, resolveCandidateFilePath } from './websocket-module-specifiers.js';
+-import { extractDirectExportedNames, JS_IDENTIFIER_RE, parseExportSpecList } from './websocket-core-bridge.js';
++import { extractDirectExportedNames, JS_IDENTIFIER_RE, maskJsComments, parseExportSpecList } from './websocket-core-bridge.js';
+ import { hasExistingDefaultExport } from './ns-core-cjs-shape.js';
+ import { getCjsNamedExports } from '../helpers/cjs-named-exports.js';
+ import { loadPersistedBootRecording } from './boot-recording.js';
+@@ -183,7 +185,7 @@ function resolvePackageRootEntry(spec, roots, platform) {
+     }
+     return null;
+ }
+-function resolvePackageSubpathEntry(pkgDir, subpath, platform) {
++function collectPackageSubpathExportsTargets(pkgDir, subpath) {
+     const candidates = [];
+     try {
+         const pkg = JSON.parse(readFileSync(path.join(pkgDir, 'package.json'), 'utf-8'));
+@@ -210,9 +212,30 @@ function resolvePackageSubpathEntry(pkgDir, subpath, platform) {
+     catch {
+         // Unreadable manifest: fall through to the on-disk lookup.
+     }
++    return candidates;
++}
++function resolvePackageSubpathEntry(pkgDir, subpath, platform) {
++    const candidates = collectPackageSubpathExportsTargets(pkgDir, subpath);
+     candidates.push(subpath);
+     return resolvePackageFileCandidates(pkgDir, candidates, platform);
+ }
++function resolvePackageSubpathExportsEntry(spec, roots, platform) {
++    const pkgSub = spec.replace(/^\/node_modules\//, '');
++    if (!pkgSub || pkgSub === spec || pkgSub.includes('/node_modules/'))
++        return null;
++    const parts = pkgSub.split('/');
++    const nameSegments = pkgSub.startsWith('@') ? 2 : 1;
++    if (parts.length <= nameSegments)
++        return null;
++    const subpath = parts.slice(nameSegments).join('/');
++    for (const root of roots) {
++        const pkgDir = path.join(root, 'node_modules', ...parts.slice(0, nameSegments));
++        // The nearest installed copy decides; a hoisted copy never shadows it.
++        if (existsSync(pkgDir))
++            return resolvePackageFileCandidates(pkgDir, collectPackageSubpathExportsTargets(pkgDir, subpath), platform);
++    }
++    return null;
++}
+ /** `/node_modules/<pkg>` or `/node_modules/@scope/<pkg>` with no subpath. */
+ function isPackageRootSpec(spec) {
+     const pkgSub = spec.replace(/^\/node_modules\//, '');
+@@ -232,6 +255,12 @@ function resolveSpecToFile(spec, projectRoot, workspaceRoot, platform) {
+         if (entry)
+             return entry;
+     }
++    // Declared exports targets win over shipped sources and stubs at the subpath.
++    if (!SCRIPT_EXT_RE.test(spec)) {
++        const entry = resolvePackageSubpathExportsEntry(spec, roots, platform);
++        if (entry)
++            return entry;
++    }
+     for (const candidate of buildDepsCandidateSpecs(spec, platform)) {
+         const abs = resolveCandidateFilePath(candidate, projectRoot, workspaceRoot);
+         if (abs)
+@@ -508,9 +537,9 @@ function createDepsAngularLinkerPlugin(projectRoot) {
+ }
+ // ============================================================================
+ // Disk cache — same shape as the core bundle cache (node_modules/.ns-vite).
+-// The key covers the lockfile (dependency identity), the full entry set
+-// (recorded + vendor-seeded), defines, and the vite package version. Opt out
+-// with `NS_DEPS_BUNDLE_NO_DISK_CACHE=1`.
++// The key covers the lockfile (dependency identity), dependency patches, the
++// full entry set (recorded + vendor-seeded), defines, and the vite package
++// version. Opt out with `NS_DEPS_BUNDLE_NO_DISK_CACHE=1`.
+ // ============================================================================
+ const DEPS_BUNDLE_DISK_CACHE_SCHEMA = 4;
+ function isDepsBundleDiskCacheDisabled(env = process.env) {
+@@ -528,6 +557,49 @@ function lockfileFingerprint(projectRoot) {
+     }
+     return 'none';
+ }
++function patchFileStamp(file) {
++    try {
++        const st = statSync(file);
++        return `${file}:${st.mtimeMs}:${st.size}`;
++    }
++    catch {
++        return `${file}:missing`;
++    }
++}
++function collectPatchStamps(root) {
++    const stamps = [];
++    try {
++        const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf-8'));
++        const declared = { ...(pkg?.pnpm?.patchedDependencies || {}), ...(pkg?.patchedDependencies || {}) };
++        for (const name of Object.keys(declared).sort()) {
++            stamps.push(`${name}=${patchFileStamp(path.resolve(root, String(declared[name])))}`);
++        }
++    }
++    catch { }
++    try {
++        // patch-package's default directory; its patches are not declared anywhere.
++        const dir = path.join(root, 'patches');
++        const names = readdirSync(dir)
++            .filter((name) => name.endsWith('.patch'))
++            .sort();
++        for (const name of names) {
++            stamps.push(patchFileStamp(path.join(dir, name)));
++        }
++    }
++    catch { }
++    return stamps;
++}
++/**
++ * Fingerprints the patch files that change installed dependencies without changing the lockfile: `patchedDependencies` and `pnpm.patchedDependencies` entries plus patch-package's `patches/*.patch`, of the app and the workspace root, by mtime and size.
++ * @param projectRoot app root
++ * @param workspaceRoot monorepo workspace root, or null outside a monorepo
++ * @returns a stable fingerprint, `none` when there are no patches
++ */
++export function patchedDependenciesFingerprint(projectRoot, workspaceRoot) {
++    const roots = [projectRoot, ...(workspaceRoot && path.resolve(workspaceRoot) !== path.resolve(projectRoot) ? [workspaceRoot] : [])];
++    const stamps = roots.flatMap((root) => collectPatchStamps(root));
++    return stamps.length ? stamps.join('|') : 'none';
++}
+ export function computeDepsBundleCacheKey(input) {
+     const payload = JSON.stringify({
+         schema: DEPS_BUNDLE_DISK_CACHE_SCHEMA,
+@@ -537,6 +609,7 @@ export function computeDepsBundleCacheKey(input) {
+         defines: input.defines,
+         entryKeys: input.entryKeys,
+         lockfile: input.lockfile,
++        patches: input.patches ?? 'none',
+         vitePackageVersion: input.vitePackageVersion,
+     });
+     return createHash('sha1').update(payload).digest('hex');
+@@ -680,6 +753,7 @@ export async function generateDepsBundle(options) {
+             defines,
+             entryKeys: entries.map((e) => e.key).sort(),
+             lockfile: lockfileFingerprint(projectRoot),
++            patches: patchedDependenciesFingerprint(projectRoot, workspaceRoot),
+             vitePackageVersion: getVitePackageVersion(),
+         });
+         const cached = tryLoadDepsBundleFromDisk(projectRoot, String(platform), cacheKey);
+@@ -895,8 +969,10 @@ export function collectDepsModuleExportInfo(absPath, platform, seen = new Set())
+             names.add(exportedName);
+         }
+     }
+-    const starRe = /^[ \t]*export\s+\*\s+from\s+["']([^"']+)["']/gm;
+-    while ((match = starRe.exec(code)) !== null) {
++    // Minified dists emit `export*from"./x";` without spaces, after `;` or `}`.
++    const starRe = /(?:^|[;}])[ \t]*export\s*\*\s*from\s*["']([^"']+)["']/gm;
++    const starScanCode = maskJsComments(code);
++    while ((match = starRe.exec(starScanCode)) !== null) {
+         const spec = match[1];
+         const target = spec.startsWith('.') ? resolveLocalReExportTarget(spec, absPath, platform) : resolveBareReExportTarget(spec, absPath, platform);
+         if (!target)
+@@ -996,6 +1072,14 @@ export function createDepsBundleService(options) {
+             // No recording is fine: the vendor collection seeds first-boot entries.
+             const recordedPaths = options.getRecordedPaths() ?? [];
+             building = generateDepsBundle({ ...options, recordedPaths })
++                .catch((error) => {
++                // A recorded file the bundle cannot take must not cost the app the
++                // bundle it gets from the vendor collection alone.
++                if (!resolveDepsEntriesFromRecording(recordedPaths, options.projectRoot, workspaceRoot, String(options.platform)).length)
++                    throw error;
++                console.warn(`[ns-deps-bundle] bundle build with the boot recording FAILED — retrying without it. Delete node_modules/.ns-vite/boot-closure-*.json if this repeats on every start. Error: ${error?.message || error}`);
++                return generateDepsBundle({ ...options, recordedPaths: [] });
++            })
+                 .then((built) => {
+                 state = built;
+                 return built;
+diff --git a/node_modules/@nativescript/vite/hmr/server/framework-strategy.d.ts b/node_modules/@nativescript/vite/hmr/server/framework-strategy.d.ts
+index a07ce61..9266638 100644
+--- a/node_modules/@nativescript/vite/hmr/server/framework-strategy.d.ts
++++ b/node_modules/@nativescript/vite/hmr/server/framework-strategy.d.ts
+@@ -149,13 +149,16 @@ export interface FrameworkServerStrategy {
+      * `handleHotUpdate` drives the in-place component update instead. For
+      * Angular with Analog `liveReload` active this is essential: Analog emits
+      * `angular:component-update` only while the css's `?direct` module is absent
+-     * from the graph, and the prologue's broadcast makes the device fetch
+-     * `…?direct=1`, which creates that module and flips Analog to its
++     * from the graph, and compiling `…?direct` for the prologue's broadcast (the
++     * server's `cssText` load, or the device's `…?direct=1` fetch fallback)
++     * creates that module and flips Analog to its
+      * (NativeScript-inert) Vite css-update branch on every subsequent edit. The
+-     * global app-entry CSS path is unaffected (it is not component-scoped).
++     * global app-entry CSS path is unaffected (it is not component-scoped). Vue
++     * claims an edited `file` that only SFC `<style>` blocks consume: it
++     * re-assembles those SFCs, so the raw file must not be installed globally.
+      * Defaults to `false` (every flavor keeps the component-style broadcast).
+      */
+-    ownsComponentStyleHmr?(server: ViteDevServer): boolean;
++    ownsComponentStyleHmr?(server: ViteDevServer, file: string): boolean;
+     /**
+      * Content-file edits (Tailwind scans) that change the generated `app.css`
+      * are normally broadcast as a standalone `ns:css-updates`. Return `true`
+diff --git a/node_modules/@nativescript/vite/hmr/server/websocket-hot-update.js b/node_modules/@nativescript/vite/hmr/server/websocket-hot-update.js
+index a017fd8..7aaeb6b 100644
+--- a/node_modules/@nativescript/vite/hmr/server/websocket-hot-update.js
++++ b/node_modules/@nativescript/vite/hmr/server/websocket-hot-update.js
+@@ -5,7 +5,7 @@ import { collectGraphUpdateModulesForHotUpdate } from '../frameworks/angular/ser
+ import { getAppCssState } from '../../helpers/app-css-state.js';
+ import { classifyHmrUpdateKind, formatHmrUpdateSummary } from './perf-instrumentation.js';
+ import { createHmrPendingMessage } from './websocket-hmr-pending.js';
+-import { appCssRootRelPath, buildCssUpdateItem, buildCssUpdatesMessage } from './css-update-message.js';
++import { appCssRootRelPath, buildCssUpdateItem, buildCssUpdatesMessage, loadCssUpdateText } from './css-update-message.js';
+ import { processContentCssUpdate } from './content-css-update.js';
+ import { getServerOrigin } from './server-origin.js';
+ /**
+@@ -206,7 +206,7 @@ export async function runHotUpdatePrologue(ctx, deps) {
+     //
+     //   • COMPONENT style (`styleUrls`, including workspace-library
+     //     components). Broadcast the style file's OWN path under a per-file
+-    //     tag. The device fetches that component's CSS and replaces just that
++    //     tag. The device applies that component's CSS and replaces just that
+     //     file's selectors (`addTaggedAdditionalCSS` keyed by the file path),
+     //     re-styling the live view without a reboot or `ɵɵreplaceMetadata`
+     //     swap. `app.css` is never involved — it does not contain the
+@@ -220,11 +220,12 @@ export async function runHotUpdatePrologue(ctx, deps) {
+         // Component-scoped style edit the framework applies in place itself
+         // (Angular + Analog liveReload → `angular:component-update`). Suppress
+         // the `ns:css-updates` broadcast: it can't win the emulated-scoping
+-        // specificity battle anyway, AND the device's `?direct=1` fetch would
++        // specificity battle anyway, AND compiling the css for the broadcast
++        // (the `cssText` load below, or the device's `?direct=1` fetch) would
+         // create the css `?direct` module that stops the framework from
+         // re-emitting its component-update on subsequent edits. The framework's
+         // own `handleHotUpdate` (a separate plugin) drives the update.
+-        if (!isGlobalStyle && strategy.ownsComponentStyleHmr?.(server)) {
++        if (!isGlobalStyle && strategy.ownsComponentStyleHmr?.(server, file)) {
+             updateMetrics.tAfterFramework = Date.now();
+             if (verbose)
+                 console.log(`[hmr-ws] component style edit ${file} → left to framework component-update (no css broadcast)`);
+@@ -245,7 +246,8 @@ export async function runHotUpdatePrologue(ctx, deps) {
+             return null;
+         }
+         try {
+-            const msg = buildCssUpdatesMessage(server, [buildCssUpdateItem(broadcastPath, { tag })]);
++            const cssText = await loadCssUpdateText(server, broadcastPath, { verbose });
++            const msg = buildCssUpdatesMessage(server, [buildCssUpdateItem(broadcastPath, { tag, cssText })]);
+             wss.clients.forEach((client) => {
+                 if (isSocketClientOpen(client)) {
+                     client.send(JSON.stringify(msg));
+diff --git a/node_modules/@nativescript/vite/hmr/server/websocket-served-module-helpers.js b/node_modules/@nativescript/vite/hmr/server/websocket-served-module-helpers.js
+index 6004d30..a5f2406 100644
+--- a/node_modules/@nativescript/vite/hmr/server/websocket-served-module-helpers.js
++++ b/node_modules/@nativescript/vite/hmr/server/websocket-served-module-helpers.js
+@@ -394,10 +394,8 @@ function scanModuleExportSurface(code) {
+         }
+     }
+     const starSources = [];
+-    // Tolerate trailing comments/code on the line (see the identical fix in
+-    // websocket-core-bridge.ts: a strict `$` anchor silently skipped
+-    // `export * from './layouts'; // barrel export` lines).
+-    for (const m of code.matchAll(/^[ \t]*export\s+\*\s+from\s+["']([^"']+)["'][^\n]*$/gm)) {
++    // Minified dists emit `export*from"./x";` without spaces, after `;` or `}`.
++    for (const m of code.matchAll(/(?:^|[;}])[ \t]*export\s*\*\s*from\s*["']([^"']+)["']/gm)) {
+         starSources.push(m[1]);
+     }
+     return { ownNames, starSources };
+diff --git a/node_modules/@nativescript/vite/hmr/server/websocket.js b/node_modules/@nativescript/vite/hmr/server/websocket.js
+index e6a1443..11b6ab3 100644
+--- a/node_modules/@nativescript/vite/hmr/server/websocket.js
++++ b/node_modules/@nativescript/vite/hmr/server/websocket.js
+@@ -495,7 +495,7 @@ function createHmrWebSocketPlugin(opts, strategy) {
+                         console.info(line);
+                 });
+             }
+-            server.middlewares.use((req, res, next) => {
++            const bootTraceMiddleware = (req, res, next) => {
+                 try {
+                     const urlObj = new URL(req.url || '', 'http://localhost');
+                     // Boot recording sees every request first: the `/__ns_dev__/session`
+@@ -527,7 +527,9 @@ function createHmrWebSocketPlugin(opts, strategy) {
+                 }
+                 catch { }
+                 next();
+-            });
++            };
++            // Ahead of ns-hmr-client, which ends /__ns_dev__/session without next().
++            server.middlewares.stack.unshift({ route: '', handle: bootTraceMiddleware });
+             // Populate is started from the post hook returned below, not here.
+             // Disable via `NS_VITE_HMR_DISABLE_POPULATE=1` when profiling whether
+             // populate is helping or hurting a specific app.
+diff --git a/node_modules/@nativescript/vite/hmr/shared/ns-globals.d.ts b/node_modules/@nativescript/vite/hmr/shared/ns-globals.d.ts
+index fa21f81..23481ce 100644
+--- a/node_modules/@nativescript/vite/hmr/shared/ns-globals.d.ts
++++ b/node_modules/@nativescript/vite/hmr/shared/ns-globals.d.ts
+@@ -64,6 +64,8 @@ declare global {
+     var __NS_HMR_APP_CSS_AST__: any;
+     var __NS_REGISTER_CSS__: ((tag: string, cssText: string) => void) | undefined;
+     var __NS_PENDING_CSS__: Record<string, string> | null | undefined;
++    var __NS_CSS_TAG_ORDER__: Map<string, string> | undefined;
++    var __NS_CSS_REAPPLY_AFTER__: ((tag: string | null) => number) | undefined;
+     var __NS_HMR_IMPORT__: ((url: string) => Promise<unknown>) | undefined;
+     var __NS_HMR_ON_UPDATE__: ((payload: {
+         type: 'full-graph' | 'delta';
+diff --git a/node_modules/@nativescript/vite/hmr/shared/protocol.d.ts b/node_modules/@nativescript/vite/hmr/shared/protocol.d.ts
+index 8703a67..f7e5618 100644
+--- a/node_modules/@nativescript/vite/hmr/shared/protocol.d.ts
++++ b/node_modules/@nativescript/vite/hmr/shared/protocol.d.ts
+@@ -37,6 +37,12 @@ export interface CssUpdateItem {
+      * independently of `app.css`.
+      */
+     tag?: string;
++    /**
++     * The compiled stylesheet, applied by the client as is. Omitted when the
++     * server could not compile it (and by older servers); the client then
++     * fetches `<origin><path>?direct=1` instead.
++     */
++    cssText?: string;
+ }
+ /** A single Vue SFC registry entry carried inside `ns:vue-sfc-registry`. */
+ export interface VueSfcRegistryEntry {
+@@ -124,7 +130,7 @@ export interface VueSfcRegistryMessage {
+     entries: VueSfcRegistryEntry[];
+     ts: number;
+ }
+-/** Mapping-only Vue SFC registry update emitted ahead of the artifact for a changed `.vue` file. */
++/** Mapping-only Vue SFC registry update emitted ahead of the artifact for a changed `.vue` file, or for an SFC whose `<style>` depends on a changed stylesheet. */
+ export interface VueSfcRegistryUpdateMessage {
+     type: 'ns:vue-sfc-registry-update';
+     path: string;

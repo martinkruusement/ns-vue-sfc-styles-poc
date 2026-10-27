@@ -1,0 +1,155 @@
+diff --git a/node_modules/nativescript-vue/dist/cssVars.d.ts b/node_modules/nativescript-vue/dist/cssVars.d.ts
+new file mode 100644
+index 0000000..b4aeea7
+--- /dev/null
++++ b/node_modules/nativescript-vue/dist/cssVars.d.ts
+@@ -0,0 +1,12 @@
++/**
++ * Runtime half of `v-bind()` in SFC `<style>` blocks; the SFC compiler
++ * injects the call. The variables are set as unscoped css variables on the
++ * component's root views, where `var()` resolves them for the views and
++ * their descendants.
++ */
++export declare function useCssVars(getter: (ctx: any) => Record<string, unknown>): void;
++/**
++ * Returns the class map of a `<style module>` block, the object templates
++ * read as `$style`.
++ */
++export declare function useCssModule(name?: string): Record<string, string>;
+diff --git a/node_modules/nativescript-vue/dist/cssVars.js b/node_modules/nativescript-vue/dist/cssVars.js
+new file mode 100644
+index 0000000..e276ed8
+--- /dev/null
++++ b/node_modules/nativescript-vue/dist/cssVars.js
+@@ -0,0 +1,106 @@
++import { Fragment, getCurrentInstance, onBeforeUpdate, onMounted, onUpdated, queuePostFlushCb, warn, watch, } from '@vue/runtime-core';
++import { EMPTY_OBJ, getEscapedCssVarName, isString, normalizeCssVarValue, NOOP, ShapeFlags, } from '@vue/shared';
++// last value written per variable, so unchanged values skip the restyle
++const appliedCssVars = new WeakMap();
++/**
++ * Runtime half of `v-bind()` in SFC `<style>` blocks; the SFC compiler
++ * injects the call. The variables are set as unscoped css variables on the
++ * component's root views, where `var()` resolves them for the views and
++ * their descendants.
++ */
++export function useCssVars(getter) {
++    const instance = getCurrentInstance();
++    if (!instance) {
++        if (__DEV__) {
++            warn(`useCssVars is called without current active component instance.`);
++        }
++        return;
++    }
++    const trackedChildren = new WeakSet();
++    // a child re-rendering its own root needs the variables again
++    const trackChild = (child) => {
++        if (!trackedChildren.has(child)) {
++            trackedChildren.add(child);
++            onUpdated(() => queuePostFlushCb(setVars), child);
++        }
++    };
++    const setVars = () => {
++        setVarsOnVNode(instance.subTree, getter(instance.proxy), trackChild);
++    };
++    onBeforeUpdate(() => {
++        queuePostFlushCb(setVars);
++    });
++    onMounted(() => {
++        watch(setVars, NOOP, { flush: 'post' });
++    });
++}
++function setVarsOnVNode(vnode, vars, trackChild) {
++    while (vnode.component) {
++        trackChild(vnode.component);
++        vnode = vnode.component.subTree;
++    }
++    if (vnode.shapeFlag & ShapeFlags.ELEMENT && vnode.el) {
++        setVarsOnNode(vnode.el, vars);
++    }
++    else if (vnode.type === Fragment) {
++        vnode.children.forEach((child) => setVarsOnVNode(child, vars, trackChild));
++    }
++}
++function setVarsOnNode(el, vars) {
++    const view = el.nativeView;
++    const style = view.style;
++    if (typeof style?.setUnscopedCssVariable !== 'function') {
++        return;
++    }
++    let applied = appliedCssVars.get(el);
++    if (!applied) {
++        appliedCssVars.set(el, (applied = new Map()));
++    }
++    let changed = false;
++    for (const key in vars) {
++        const raw = vars[key];
++        // core applies blank values literally; the DOM unsets the declaration
++        const value = isString(raw) && !raw.trim() ? 'unset' : normalizeCssVarValue(raw);
++        // stylesheets keep expression keys escaped: --id-theme\.size
++        const names = [`--${key}`, `--${getEscapedCssVarName(key, false)}`];
++        for (const name of names) {
++            if (applied.get(name) !== value) {
++                style.setUnscopedCssVariable(name, value);
++                applied.set(name, value);
++                changed = true;
++            }
++        }
++    }
++    if (changed) {
++        view._onCssStateChange();
++    }
++}
++/**
++ * Returns the class map of a `<style module>` block, the object templates
++ * read as `$style`.
++ */
++export function useCssModule(name = '$style') {
++    const instance = getCurrentInstance();
++    if (!instance) {
++        if (__DEV__) {
++            warn(`useCssModule must be called inside setup()`);
++        }
++        return EMPTY_OBJ;
++    }
++    const modules = instance.type.__cssModules;
++    if (!modules) {
++        if (__DEV__) {
++            warn(`Current instance does not have CSS modules injected.`);
++        }
++        return EMPTY_OBJ;
++    }
++    const mod = modules[name];
++    if (!mod) {
++        if (__DEV__) {
++            warn(`Current instance does not have CSS module named "${name}".`);
++        }
++        return EMPTY_OBJ;
++    }
++    return mod;
++}
++//# sourceMappingURL=cssVars.js.map
+\ No newline at end of file
+diff --git a/node_modules/nativescript-vue/dist/index.d.ts b/node_modules/nativescript-vue/dist/index.d.ts
+index 2512c70..92e824e 100644
+--- a/node_modules/nativescript-vue/dist/index.d.ts
++++ b/node_modules/nativescript-vue/dist/index.d.ts
+@@ -20,6 +20,7 @@ export * from './renderer';
+ export { createNativeView, ELEMENT_REF, isOn } from './runtimeHelpers';
+ export * from '@vue/runtime-core';
+ export { vShow } from './directives/vShow';
++export { useCssModule, useCssVars } from './cssVars';
+ export { $closeModal, $showModal } from './plugins/modals';
+ export { $navigateBack, $navigateTo } from './plugins/navigation';
+ export { KeepAlive, TransitionGroup } from './renderer/runtimeDomOverrides';
+diff --git a/node_modules/nativescript-vue/dist/index.js b/node_modules/nativescript-vue/dist/index.js
+index e73b558..f08da94 100644
+--- a/node_modules/nativescript-vue/dist/index.js
++++ b/node_modules/nativescript-vue/dist/index.js
+@@ -17,6 +17,7 @@ export * from './renderer';
+ export { createNativeView, ELEMENT_REF, isOn } from './runtimeHelpers';
+ export * from '@vue/runtime-core';
+ export { vShow } from './directives/vShow';
++export { useCssModule, useCssVars } from './cssVars';
+ export { $closeModal, $showModal } from './plugins/modals';
+ export { $navigateBack, $navigateTo } from './plugins/navigation';
+ export { KeepAlive, TransitionGroup } from './renderer/runtimeDomOverrides';
